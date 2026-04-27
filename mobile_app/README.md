@@ -1,4 +1,4 @@
-<![CDATA[# 📱 SafeGuard Mobile — IHS Surveillance App
+# 📱 SafeGuard Mobile — IHS Surveillance App
 
 > Flutter companion app for the SafeGuard home safety surveillance system. Monitoring, alerts, AI summaries, and first aid guidance — all in your pocket.
 

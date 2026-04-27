@@ -1,4 +1,4 @@
-<![CDATA[# 🛡️ SafeGuard — Intelligent Home Safety Surveillance System
+# 🛡️ SafeGuard — Intelligent Home Safety Surveillance System
 
 > **Final Year Project** — Real-time fall detection, hazard recognition, child safety monitoring, and AI-powered emergency guidance.
 

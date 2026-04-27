@@ -1,4 +1,4 @@
-<![CDATA[# ⚙️ SafeGuard — Inference Engine
+# ⚙️ SafeGuard — Inference Engine
 
 > Python-based real-time inference server: fall detection, hazard recognition, child safety, and AI-powered first aid guidance.
 
