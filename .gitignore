@@ -1,0 +1,72 @@
+<![CDATA[# ==============================================================================
+# SafeGuard .gitignore
+# Only track: Engine/ and mobile_app/ (plus root-level files)
+# ==============================================================================
+
+# ─── Ignore all top-level directories except Engine and mobile_app ────────────
+/books/
+/docs/
+/weights/
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+env/
+.env.local
+
+# ─── Engine-specific ignores ─────────────────────────────────────────────────
+Engine/__pycache__/
+Engine/.vscode/
+Engine/datasets/
+Engine/testing/
+Engine/flutter_app/
+Engine/embeddings/
+Engine/firebase-service-account.json
+Engine/*.errors.txt
+
+# ─── Flutter / Dart ───────────────────────────────────────────────────────────
+mobile_app/.dart_tool/
+mobile_app/.idea/
+mobile_app/build/
+mobile_app/.flutter-plugins
+mobile_app/.flutter-plugins-dependencies
+mobile_app/.metadata
+mobile_app/pubspec.lock
+mobile_app/*.iml
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Secrets (never commit) ──────────────────────────────────────────────────
+*.env
+!mobile_app/.env.example
+!Engine/.env.example
+firebase-service-account.json
+google-services.json
+GoogleService-Info.plist
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.log
+*.errors.txt
+*.mp4
+*.pt
+*.npy
+*.index
+]]>

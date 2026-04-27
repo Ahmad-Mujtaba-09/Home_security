@@ -1,0 +1,20 @@
+# ── Inference Engine ──────────────────────────
+torch
+ultralytics
+opencv-python
+numpy
+scipy
+
+# ── FastAPI Backend ──────────────────────────
+fastapi
+uvicorn[standard]
+websockets
+python-dotenv
+supabase
+httpx
+
+# ── RAG Chatbot ──────────────────────────────
+PyMuPDF
+faiss-cpu
+rank-bm25
+sentence-transformers

@@ -1,0 +1,790 @@
+"""
+FastAPI Backend for Surveillance App
+=====================================
+WebSocket-based inference server wrapping HomeSafetyInference.
+Streams frames from the Flutter client, runs detection, and pushes alerts back.
+"""
+
+import os
+import sys
+import json
+import base64
+import logging
+import asyncio
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+import cv2
+import numpy as np
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from supabase import create_client, Client
+
+# ─── Ensure our own directory is importable ───────────────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from falldetection_v1 import HomeSafetyInference
+from rag_service import RAGService
+
+# ─── Environment ──────────────────────────────────────────────────────────────
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("surveillance-api")
+
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
+app = FastAPI(title="Surveillance Inference API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Globals initialised at startup ──────────────────────────────────────────
+supabase: Optional[Client] = None
+inference_system: Optional[HomeSafetyInference] = None
+rag_service: Optional[RAGService] = None
+
+WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "weights"
+
+
+@app.on_event("startup")
+async def startup():
+    global supabase, inference_system, rag_service
+
+    # Supabase client (service role for server-side inserts)
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        logger.info("Supabase client initialised.")
+    else:
+        logger.warning("Supabase credentials missing — DB logging disabled.")
+
+    # Inference engine
+    logger.info(f"Loading weights from {WEIGHTS_DIR} ...")
+    inference_system = HomeSafetyInference(
+        tcn_weights=str(WEIGHTS_DIR / "tcn_fall_best.pt"),
+        norm_mean=str(WEIGHTS_DIR / "norm_mean.npy"),
+        norm_std=str(WEIGHTS_DIR / "norm_std.npy"),
+        hazard_weights=str(WEIGHTS_DIR / "best_int8_openvino_model"),
+        mode="hybrid",
+        fall_threshold=0.65,
+    )
+    logger.info("Inference engine ready.")
+
+    # RAG service (loads pre-built FAISS index — embedding model lazy-loaded on first query)
+    rag_service = RAGService()
+    if rag_service.load():
+        logger.info("RAG service loaded successfully.")
+    else:
+        logger.warning("RAG service not available — run `python generate_embeddings.py` first.")
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _get_user_profile(user_id: str) -> Dict:
+    """Fetch user profile from Supabase. Returns defaults if unavailable."""
+    defaults = {"child_module_enabled": True, "elderly_module_enabled": True}
+    if supabase is None:
+        logger.warning("Supabase not configured — using default profile (both modules ON)")
+        return defaults
+    try:
+        resp = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+        if resp.data:
+            logger.info(f"Profile for {user_id}: child={resp.data.get('child_module_enabled')}, elderly={resp.data.get('elderly_module_enabled')}")
+            return resp.data
+    except Exception as e:
+        logger.warning(f"Profile fetch failed for {user_id}: {e}")
+    return defaults
+
+
+def _log_event(user_id: str, alert: Dict):
+    """Write a detection event to the Supabase history table and send FCM push."""
+    if supabase is None:
+        return
+    try:
+        row = {
+            "user_id": user_id,
+            "event_type": alert.get("type", "UNKNOWN"),
+            "confidence": alert.get("prob"),
+            "frame_count": alert.get("frame"),
+        }
+        supabase.table("history").insert(row).execute()
+
+        # Send FCM push notification (throttled)
+        _send_fcm_push(user_id, alert)
+    except Exception as e:
+        logger.error(f"Failed to log event: {e}")
+
+
+# ── FCM Push Notification Sender (HTTP v1 API) ────────────────────────────────
+_fcm_last_sent: Dict[str, float] = {}   # "user_id:event_type" → timestamp
+FCM_THROTTLE_SECS = 60                    # Same as mobile app throttle
+_fcm_access_token: Optional[str] = None
+_fcm_token_expiry: float = 0
+
+def _get_fcm_access_token() -> Optional[str]:
+    """Get a valid OAuth2 access token for FCM using the service account."""
+    global _fcm_access_token, _fcm_token_expiry
+    import time
+
+    # Return cached token if still valid (with 60s buffer)
+    if _fcm_access_token and time.time() < _fcm_token_expiry - 60:
+        return _fcm_access_token
+
+    sa_path = Path(__file__).resolve().parent / "firebase-service-account.json"
+    if not sa_path.exists():
+        return None
+
+    try:
+        import json
+        import jwt  # PyJWT
+        import httpx
+
+        with open(sa_path) as f:
+            sa = json.load(f)
+
+        # Create JWT assertion
+        now = int(time.time())
+        payload = {
+            "iss": sa["client_email"],
+            "sub": sa["client_email"],
+            "aud": "https://oauth2.googleapis.com/token",
+            "iat": now,
+            "exp": now + 3600,
+            "scope": "https://www.googleapis.com/auth/firebase.messaging",
+        }
+        assertion = jwt.encode(payload, sa["private_key"], algorithm="RS256")
+
+        # Exchange JWT for access token
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": assertion,
+                },
+            )
+            token_data = resp.json()
+            _fcm_access_token = token_data["access_token"]
+            _fcm_token_expiry = now + token_data.get("expires_in", 3600)
+            return _fcm_access_token
+    except Exception as e:
+        logger.warning(f"FCM token fetch failed: {e}")
+        return None
+
+
+def _send_fcm_push(user_id: str, alert: Dict):
+    """Send an FCM push notification via HTTP v1 API."""
+    import time
+    import httpx
+
+    event_type = alert.get("type", "UNKNOWN")
+    throttle_key = f"{user_id}:{event_type}"
+    now = time.time()
+
+    # Throttle: same event type per user only once per 60s
+    if throttle_key in _fcm_last_sent:
+        elapsed = now - _fcm_last_sent[throttle_key]
+        if elapsed < FCM_THROTTLE_SECS:
+            logger.debug(f"FCM throttled: {event_type} ({elapsed:.0f}s < {FCM_THROTTLE_SECS}s)")
+            return
+    _fcm_last_sent[throttle_key] = now
+
+    if supabase is None:
+        logger.warning("FCM push skipped — supabase is None")
+        return
+
+    access_token = _get_fcm_access_token()
+    if not access_token:
+        logger.warning("FCM push skipped — could not get access token")
+        return
+
+    try:
+        # Get user's FCM token from Supabase
+        resp = supabase.table("fcm_tokens").select("token").eq("user_id", user_id).execute()
+        if not resp.data:
+            logger.warning(f"FCM push skipped — no FCM token found for user {user_id}")
+            return
+        token = resp.data[0].get("token")
+        if not token:
+            logger.warning(f"FCM push skipped — empty token for user {user_id}")
+            return
+
+        logger.info(f"FCM: sending push to user {user_id[:8]}... for {event_type}")
+
+        # Build notification
+        confidence = alert.get("prob", 0)
+        title = f"⚠️ {event_type.replace('_', ' ').title()} Detected"
+        body = f"Confidence: {confidence:.0%}. Check the app for details."
+
+        # FCM project ID from service account
+        sa_path = Path(__file__).resolve().parent / "firebase-service-account.json"
+        with open(sa_path) as f:
+            project_id = __import__("json").load(f)["project_id"]
+
+        # Send via FCM HTTP v1 API
+        with httpx.Client(timeout=10) as client:
+            fcm_resp = client.post(
+                f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "message": {
+                        "token": token,
+                        "notification": {
+                            "title": title,
+                            "body": body,
+                        },
+                        "android": {
+                            "priority": "high",
+                            "notification": {
+                                "sound": "default",
+                                "channel_id": "safeguard_alerts",
+                            },
+                        },
+                        "data": {
+                            "event_type": event_type,
+                            "confidence": str(confidence),
+                            "user_id": user_id,
+                        },
+                    }
+                },
+            )
+            logger.info(f"FCM response: {fcm_resp.status_code} — {fcm_resp.text[:200]}")
+    except Exception as e:
+        logger.warning(f"FCM push failed: {e}")
+
+
+def _decode_frame(data: bytes) -> np.ndarray:
+    """Decode a JPEG/PNG byte buffer into an OpenCV BGR frame."""
+    arr = np.frombuffer(data, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Could not decode frame")
+    return frame
+
+
+# ─── REST endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "engine_loaded": inference_system is not None}
+
+
+@app.get("/api/history")
+async def get_history(user_id: str = Query(...)):
+    """Fetch full history for a user (Flutter calls this directly)."""
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    try:
+        resp = (
+            supabase.table("history")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("timestamp", desc=True)
+            .limit(200)
+            .execute()
+        )
+        return {"data": resp.data}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/profile")
+async def get_profile(user_id: str = Query(...)):
+    """Fetch the profile for a user."""
+    profile = _get_user_profile(user_id)
+    return {"data": profile}
+
+
+# ─── WebSocket inference ─────────────────────────────────────────────────────
+
+@app.websocket("/ws/inference/{user_id}")
+async def websocket_inference(websocket: WebSocket, user_id: str):
+    """
+    Main real-time inference channel.
+
+    Protocol
+    --------
+    Client sends:  binary JPEG frame  OR  JSON {"image": "<base64>"}.
+    Server sends:  JSON {"alerts": [...], "frame": <int>}  after every frame.
+
+    The engine checks the user's profile (child vs elderly modules) and runs
+    only relevant detection logic.
+    """
+    await websocket.accept()
+    logger.info(f"WebSocket connected — user {user_id}")
+
+    if inference_system is None:
+        await websocket.send_json({"error": "Engine not loaded"})
+        await websocket.close()
+        return
+
+    # Fetch user preferences
+    profile = _get_user_profile(user_id)
+    child_enabled = profile.get("child_module_enabled", True)
+    elderly_enabled = profile.get("elderly_module_enabled", True)
+
+    logger.info(f"User {user_id} — child={child_enabled}, elderly={elderly_enabled}")
+
+    # Reset engine state and set module toggles for this session
+    inference_system.reset_state()
+    inference_system.child_enabled = child_enabled
+    inference_system.elderly_enabled = elderly_enabled
+    frame_count = 0
+
+    try:
+        while True:
+            raw = await websocket.receive()
+
+            # Handle binary or text messages
+            if "bytes" in raw and raw["bytes"]:
+                frame_bytes = raw["bytes"]
+            elif "text" in raw and raw["text"]:
+                payload = json.loads(raw["text"])
+                if "image" in payload:
+                    frame_bytes = base64.b64decode(payload["image"])
+                else:
+                    # Control message — skip
+                    continue
+            else:
+                continue
+
+            try:
+                frame = _decode_frame(frame_bytes)
+            except ValueError:
+                await websocket.send_json({"error": "Bad frame", "frame": frame_count})
+                continue
+
+            # Live profile refresh every 60 frames (~2s) so toggle changes take effect
+            if frame_count % 60 == 0 and frame_count > 0:
+                profile = _get_user_profile(user_id)
+                inference_system.child_enabled = profile.get("child_module_enabled", True)
+                inference_system.elderly_enabled = profile.get("elderly_module_enabled", True)
+
+            # Run inference (engine skips disabled modules internally)
+            _, alerts, detections = inference_system.process_frame(frame, frame_count)
+
+            # Log to Supabase
+            for a in alerts:
+                _log_event(user_id, a)
+
+            # Send lightweight detection metadata (Flutter draws overlays on camera preview)
+            await websocket.send_json({
+                "alerts": alerts,
+                "detections": detections,
+                "frame": frame_count,
+            })
+
+            frame_count += 1
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected — user {user_id}, {frame_count} frames processed.")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
+
+# ─── WebSocket video file processing ─────────────────────────────────────────
+
+@app.websocket("/ws/process-video/{user_id}")
+async def websocket_process_video(websocket: WebSocket, user_id: str):
+    """
+    Server-side video processing channel.
+
+    Protocol
+    --------
+    Client sends:  JSON {"video": "<base64>", "filename": "..."} as the first message.
+    Server sends:  JSON {"alerts": [...], "frame": <int>, "annotated_frame": "<base64>", "status": "processing"}
+                   for each frame, then {"status": "done", "total_frames": N, "total_alerts": N}.
+    """
+    await websocket.accept()
+    logger.info(f"Video processing WS connected — user {user_id}")
+
+    if inference_system is None:
+        await websocket.send_json({"error": "Engine not loaded"})
+        await websocket.close()
+        return
+
+    try:
+        # Receive the video file
+        raw = await websocket.receive()
+        if "text" in raw and raw["text"]:
+            payload = json.loads(raw["text"])
+            video_bytes = base64.b64decode(payload.get("video", ""))
+            filename = payload.get("filename", "upload.mp4")
+        elif "bytes" in raw and raw["bytes"]:
+            video_bytes = raw["bytes"]
+            filename = "upload.mp4"
+        else:
+            await websocket.send_json({"error": "No video data received"})
+            await websocket.close()
+            return
+
+        # Write to temp file for OpenCV
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".{filename.rsplit('.', 1)[-1]}")
+        os.close(tmp_fd)
+        with open(tmp_path, "wb") as f:
+            f.write(video_bytes)
+
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            await websocket.send_json({"error": f"Cannot open video: {filename}"})
+            os.unlink(tmp_path)
+            await websocket.close()
+            return
+
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        logger.info(f"Processing video: {filename} ({total} frames)")
+
+        # Fetch user preferences and set module toggles
+        profile = _get_user_profile(user_id)
+        inference_system.reset_state()
+        inference_system.child_enabled = profile.get("child_module_enabled", True)
+        inference_system.elderly_enabled = profile.get("elderly_module_enabled", True)
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+        inference_system.fps = fps
+        frame_count = 0
+        all_alerts = []
+        MAX_DISPLAY_W = 640     # Resize before encode for bandwidth
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            annotated, alerts, _ = inference_system.process_frame(frame, frame_count)
+            all_alerts.extend(alerts)
+
+            # Resize for bandwidth if needed
+            h, w = annotated.shape[:2]
+            if w > MAX_DISPLAY_W:
+                scale = MAX_DISPLAY_W / w
+                annotated = cv2.resize(annotated, (MAX_DISPLAY_W, int(h * scale)))
+
+            _, jpeg_buf = cv2.imencode(
+                ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 50]
+            )
+            frame_b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+
+            # Stream back to Flutter
+            await websocket.send_json({
+                "alerts": alerts,
+                "frame": frame_count,
+                "total_frames": total,
+                "annotated_frame": frame_b64,
+                "status": "processing",
+            })
+
+            for a in alerts:
+                _log_event(user_id, a)
+
+            frame_count += 1
+            await asyncio.sleep(0)
+
+        cap.release()
+        os.unlink(tmp_path)
+
+        await websocket.send_json({
+            "status": "done",
+            "total_frames": frame_count,
+            "total_alerts": len(all_alerts),
+        })
+        logger.info(f"Video processing done: {frame_count} frames, {len(all_alerts)} alerts")
+
+    except WebSocketDisconnect:
+        logger.info(f"Video processing WS disconnected — user {user_id}")
+    except Exception as e:
+        logger.error(f"Video processing error: {e}")
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
+
+
+# ─── WebSocket RTSP/stream processing ────────────────────────────────────────
+
+@app.websocket("/ws/stream/{user_id}")
+async def websocket_stream(websocket: WebSocket, user_id: str):
+    """
+    Server-side RTSP/HTTP stream processing.
+
+    Protocol
+    --------
+    Client sends:  JSON {"url": "<rtsp://...>"} as the first message.
+    Server sends:  JSON {"alerts": [...], "frame": <int>, "annotated_frame": "<base64>", "status": "streaming"}
+                   for each frame, then {"status": "done"} when stream ends or client disconnects.
+    """
+    await websocket.accept()
+    logger.info(f"Stream WS connected — user {user_id}")
+
+    if inference_system is None:
+        await websocket.send_json({"error": "Engine not loaded"})
+        await websocket.close()
+        return
+
+    try:
+        # Receive the stream URL
+        raw = await websocket.receive()
+        if "text" in raw and raw["text"]:
+            payload = json.loads(raw["text"])
+            stream_url = payload.get("url", "")
+        else:
+            await websocket.send_json({"error": "No stream URL received"})
+            await websocket.close()
+            return
+
+        if not stream_url:
+            await websocket.send_json({"error": "Empty stream URL"})
+            await websocket.close()
+            return
+
+        logger.info(f"Opening stream: {stream_url}")
+        cap = cv2.VideoCapture(stream_url)
+        if not cap.isOpened():
+            await websocket.send_json({"error": f"Cannot open stream: {stream_url}"})
+            await websocket.close()
+            return
+
+        # Fetch user preferences and set module toggles
+        profile = _get_user_profile(user_id)
+        inference_system.reset_state()
+        inference_system.child_enabled = profile.get("child_module_enabled", True)
+        inference_system.elderly_enabled = profile.get("elderly_module_enabled", True)
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+        inference_system.fps = fps
+        frame_count = 0
+        all_alerts = []
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                # Stream ended or lost connection — wait a bit and retry
+                await asyncio.sleep(0.5)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+            annotated, alerts, _ = inference_system.process_frame(frame, frame_count)
+            all_alerts.extend(alerts)
+
+            # Encode annotated frame
+            _, jpeg_buf = cv2.imencode(
+                ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 60]
+            )
+            frame_b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+
+            # Stream back to Flutter
+            try:
+                await websocket.send_json({
+                    "alerts": alerts,
+                    "frame": frame_count,
+                    "annotated_frame": frame_b64,
+                    "status": "streaming",
+                })
+            except Exception:
+                break  # Client disconnected
+
+            for a in alerts:
+                _log_event(user_id, a)
+
+            frame_count += 1
+            await asyncio.sleep(0)  # Yield to event loop
+
+        cap.release()
+        try:
+            await websocket.send_json({
+                "status": "done",
+                "total_frames": frame_count,
+                "total_alerts": len(all_alerts),
+            })
+        except Exception:
+            pass
+        logger.info(f"Stream done: {frame_count} frames, {len(all_alerts)} alerts")
+
+    except WebSocketDisconnect:
+        logger.info(f"Stream WS disconnected — user {user_id}")
+    except Exception as e:
+        logger.error(f"Stream error: {e}")
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
+
+
+# ─── Gemini report (called by Flutter) ────────────────────────────────────────
+
+@app.get("/api/gemini-report")
+async def gemini_report(user_id: str = Query(...)):
+    """
+    Aggregates the last 1 hour of history and generates an AI summary via Gemini.
+    Returns a graceful message when DB or API keys are unavailable.
+    """
+    groq_check = os.getenv("GROQ_API_KEY", "")
+    if not groq_check:
+        return {"report": "⚠️ GROQ_API_KEY not set in .env. Get a free key at https://console.groq.com"}
+
+    if supabase is None:
+        return {"report": "⚠️ Database is not configured. Unable to retrieve event history. Please check your SUPABASE_SERVICE_ROLE_KEY in the .env file."}
+
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        resp = (
+            supabase.table("history")
+            .select("*")
+            .eq("user_id", user_id)
+            .gte("timestamp", cutoff)
+            .order("timestamp", desc=False)
+            .execute()
+        )
+        events = resp.data or []
+    except Exception as e:
+        logger.error(f"Gemini report DB query failed: {e}")
+        return {"report": f"⚠️ Could not retrieve event history: {e}"}
+
+    if not events:
+        return {"report": "✅ No events were detected for this user in the last hour. Everything appears to be normal."}
+
+    # ── Cluster raw events into distinct incidents (60s gap = new incident) ──
+    from datetime import timedelta
+    from dateutil import parser as dtparser
+
+    GAP_THRESHOLD = timedelta(seconds=60)  # gap > 60s between same type = new incident
+
+    incidents = []  # list of {type, start, end, count, avg_confidence}
+    for e in events:
+        etype = e.get("event_type", "unknown")
+        try:
+            ts = dtparser.parse(e.get("timestamp", ""))
+        except Exception:
+            continue
+        conf = float(e.get("confidence", 0) or 0)
+
+        # Check if this extends the last incident of same type
+        merged = False
+        if incidents and incidents[-1]["type"] == etype:
+            last = incidents[-1]
+            if (ts - last["end"]) <= GAP_THRESHOLD:
+                last["end"] = ts
+                last["count"] += 1
+                last["total_conf"] += conf
+                merged = True
+
+        if not merged:
+            incidents.append({
+                "type": etype,
+                "start": ts,
+                "end": ts,
+                "count": 1,
+                "total_conf": conf,
+            })
+
+    # Build human-readable incident summary
+    incident_lines = []
+    for i, inc in enumerate(incidents, 1):
+        avg_conf = inc["total_conf"] / inc["count"] if inc["count"] else 0
+        start_str = inc["start"].strftime("%I:%M:%S %p")
+        duration = (inc["end"] - inc["start"]).total_seconds()
+        if duration < 2:
+            time_desc = f"at {start_str}"
+        else:
+            time_desc = f"from {start_str} lasting ~{int(duration)}s"
+        incident_lines.append(
+            f"  {i}. {inc['type']} — {time_desc} "
+            f"(avg confidence: {avg_conf:.0%}, {inc['count']} raw detections)"
+        )
+
+    incident_summary = "\n".join(incident_lines)
+
+    prompt = (
+        "You are an AI caregiver assistant for a home safety surveillance system.\n"
+        "Below is a summary of DISTINCT INCIDENTS detected in the LAST 1 HOUR.\n"
+        "These have already been clustered from raw frame-level detections.\n"
+        "Events within 60 seconds of each other are grouped as one incident.\n"
+        "If the same event type appears again after a 60+ second gap, it is a SEPARATE incident — "
+        "this is important and should be highlighted.\n\n"
+        "Generate a CONCISE report (max 200 words) for a family caregiver that:\n"
+        "1. States the number of distinct incidents and their times\n"
+        "2. Highlights if multiple separate incidents occurred (e.g. fell, recovered, then fell again)\n"
+        "3. Suggests concrete next steps if warranted\n"
+        "4. Uses a compassionate but professional tone\n\n"
+        "DO NOT include any sign-offs, salutations, greetings, 'Best regards', '[Your Name]', or letter formatting. "
+        "Just output the report content directly.\n\n"
+        f"Total distinct incidents: {len(incidents)}\n"
+        f"Incidents:\n{incident_summary}"
+    )
+
+    # Call Groq API (free tier, generous limits)
+    import httpx
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    if not groq_key:
+        return {"report": "⚠️ GROQ_API_KEY not set in .env. Get a free key at https://console.groq.com"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}"},
+                json={
+                    "model": groq_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 512,
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            return {"report": body["choices"][0]["message"]["content"]}
+    except Exception as e:
+        logger.error(f"Groq API error: {e}")
+        return {"report": f"⚠️ Could not generate report: {e}"}
+
+
+# ─── First Aid RAG Chat (called by Flutter) ──────────────────────────────────
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    """
+    RAG-powered First Aid chatbot endpoint.
+    Expects JSON: {"message": str, "user_id": str, "history": [{"role": str, "text": str}, ...]}
+    Returns JSON: {"reply": str, "sources": [{"book": str, "page": int}, ...]}
+    """
+    body = await request.json()
+    user_message = body.get("message", "").strip()
+    chat_history = body.get("history", [])
+
+    if not user_message:
+        return {"reply": "Please enter a message.", "sources": []}
+
+    if rag_service is None or not rag_service.ready:
+        # Fallback: if RAG not loaded, return a helpful error
+        return {
+            "reply": "⚠️ The First Aid knowledge base is not loaded. "
+                     "Please run `python generate_embeddings.py` to build the index.",
+            "sources": []
+        }
+
+    result = await rag_service.query(user_message, chat_history)
+    return result
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
