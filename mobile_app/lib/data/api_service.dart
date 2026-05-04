@@ -188,6 +188,38 @@ class ApiService {
     return resp.statusCode == 200;
   }
 
+  // ─── Device monitoring control ────────────────────────────────────────
+
+  static Future<bool> startDeviceMonitor(String deviceId) async {
+    final base = await _getBaseUrl();
+    final resp = await http
+        .post(Uri.parse('$base/api/devices/$deviceId/start'))
+        .timeout(const Duration(seconds: 15));
+    return resp.statusCode == 200;
+  }
+
+  static Future<bool> stopDeviceMonitor(String deviceId) async {
+    final base = await _getBaseUrl();
+    final resp = await http
+        .post(Uri.parse('$base/api/devices/$deviceId/stop'))
+        .timeout(const Duration(seconds: 15));
+    return resp.statusCode == 200;
+  }
+
+  static Future<String> getDeviceMonitorStatus(String deviceId) async {
+    final base = await _getBaseUrl();
+    try {
+      final resp = await http
+          .get(Uri.parse('$base/api/devices/$deviceId/status'))
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode == 200) {
+        final body = jsonDecode(resp.body) as Map<String, dynamic>;
+        return body['monitor_status'] as String? ?? 'stopped';
+      }
+    } catch (_) {}
+    return 'stopped';
+  }
+
   // ─── Notifications inbox ─────────────────────────────────────────────────
 
   static Future<List<NotificationItem>> listNotifications(

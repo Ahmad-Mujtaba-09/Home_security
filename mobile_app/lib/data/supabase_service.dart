@@ -79,11 +79,25 @@ class SupabaseService extends ChangeNotifier {
 
   Future<void> updateProfile(UserProfile profile) async {
     _cachedProfile = profile;
-    notifyListeners();
-    await _client
-        .from(AppConstants.profilesTable)
-        .update(profile.toJson())
-        .eq('id', profile.id);
+    notifyListeners(); // Notify immediately so UI updates instantly
+    try {
+      await _client
+          .from(AppConstants.profilesTable)
+          .update(profile.toJson())
+          .eq('id', profile.id);
+      debugPrint('Profile updated for ${profile.id}');
+    } catch (e) {
+      debugPrint('updateProfile error: $e');
+      // Fallback: try upsert in case the row doesn't exist
+      try {
+        await _client
+            .from(AppConstants.profilesTable)
+            .upsert(profile.toJson());
+        debugPrint('Profile upserted for ${profile.id}');
+      } catch (e2) {
+        debugPrint('updateProfile upsert fallback also failed: $e2');
+      }
+    }
   }
 
   // ── History ──────────────────────────────────────────────────────────────

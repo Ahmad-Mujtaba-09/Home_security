@@ -25,14 +25,22 @@ def client(monkeypatch):
     fake_rag.ready = True
     fake_rag.query = AsyncMock(return_value={"reply": "hi", "sources": []})
 
+    fake_monitor = MagicMock()
+    fake_monitor.start_device = AsyncMock()
+    fake_monitor.stop_device = AsyncMock()
+    fake_monitor.get_status = MagicMock(return_value="stopped")
+    fake_monitor.active_device_ids = []
+
     monkeypatch.setattr(app_module, "supabase", fake_supabase)
     monkeypatch.setattr(app_module, "inference_system", fake_engine)
     monkeypatch.setattr(app_module, "rag_service", fake_rag)
+    monkeypatch.setattr(app_module, "device_monitor", fake_monitor)
 
     with TestClient(app_module.app) as c:
         c.fake_supabase = fake_supabase
         c.fake_engine = fake_engine
         c.fake_rag = fake_rag
+        c.fake_monitor = fake_monitor
         yield c
 
 
@@ -161,3 +169,110 @@ def test_decode_frame_valid_jpeg():
     assert ok
     out = app_module._decode_frame(buf.tobytes())
     assert out.shape == (10, 10, 3)
+
+
+# ─── Device monitor endpoints ─────────────────────────────────────────────
+
+def test_start_device_monitor_success(client):
+    fake_resp = MagicMock()
+    fake_resp.data = [{"device_id": "d1", "user_id": "u1", "stream_url": "rtsp://cam"}]
+    (client.fake_supabase.table.return_value
+        .select.return_value
+        .eq.return_value
+        .execute.return_value) = fake_resp
+    # update call for setting status to active
+    (client.fake_supabase.table.return_value
+        .update.return_value
+        .eq.return_value
+        .execute.return_value) = MagicMock(data=[{"device_id": "d1"}])
+
+    resp = client.post("/api/devices/d1/start")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "started"
+    client.fake_monitor.start_device.assert_called_once()
+
+
+def test_start_device_monitor_no_stream_url(client):
+    fake_resp = MagicMock()
+    fake_resp.data = [{"device_id": "d1", "user_id": "u1", "stream_url": None}]
+    (client.fake_supabase.table.return_value
+        .select.return_value
+        .eq.return_value
+        .execute.return_value) = fake_resp
+    resp = client.post("/api/devices/d1/start")
+    assert resp.status_code == 400
+
+
+def test_start_device_monitor_not_found(client):
+    fake_resp = MagicMock()
+    fake_resp.data = []
+    (client.fake_supabase.table.return_value
+        .select.return_value
+        .eq.return_value
+        .execute.return_value) = fake_resp
+    resp = client.post("/api/devices/d1/start")
+    assert resp.status_code == 404
+
+
+def test_stop_device_monitor(client):
+    (client.fake_supabase.table.return_value
+        .update.return_value
+        .eq.return_value
+        .execute.return_value) = MagicMock(data=[{"device_id": "d1"}])
+    resp = client.post("/api/devices/d1/stop")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "stopped"
+    client.fake_monitor.stop_device.assert_called_once_with("d1")
+
+
+def test_device_monitor_status(client):
+    client.fake_monitor.get_status.return_value = "monitoring"
+    resp = client.get("/api/devices/d1/status")
+    assert resp.status_code == 200
+    assert resp.json()["monitor_status"] == "monitoring"
+
+
+def test_delete_device_stops_monitor(client):
+    (client.fake_supabase.table.return_value
+        .delete.return_value
+        .eq.return_value
+        .execute.return_value) = MagicMock()
+    resp = client.delete("/api/devices/d1")
+    assert resp.status_code == 200
+    client.fake_monitor.stop_device.assert_called_once_with("d1")
+
+
+def test_create_device_auto_starts_if_active(client):
+    created_row = {
+        "device_id": "d1", "user_id": "u1", "device_name": "Cam",
+        "device_type": "rtsp", "stream_url": "rtsp://x", "status": "active",
+    }
+    fake_resp = MagicMock()
+    fake_resp.data = [created_row]
+    (client.fake_supabase.table.return_value
+        .insert.return_value
+        .execute.return_value) = fake_resp
+    resp = client.post("/api/devices", json={
+        "user_id": "u1", "device_name": "Cam", "device_type": "rtsp",
+        "stream_url": "rtsp://x", "status": "active",
+    })
+    assert resp.status_code == 200
+    client.fake_monitor.start_device.assert_called_once_with("d1", "rtsp://x", "u1")
+
+
+def test_create_device_no_autostart_if_inactive(client):
+    created_row = {
+        "device_id": "d2", "user_id": "u1", "device_name": "Cam2",
+        "device_type": "camera", "stream_url": "rtsp://y", "status": "inactive",
+    }
+    fake_resp = MagicMock()
+    fake_resp.data = [created_row]
+    (client.fake_supabase.table.return_value
+        .insert.return_value
+        .execute.return_value) = fake_resp
+    resp = client.post("/api/devices", json={
+        "user_id": "u1", "device_name": "Cam2", "stream_url": "rtsp://y",
+    })
+    assert resp.status_code == 200
+    client.fake_monitor.start_device.assert_not_called()
+

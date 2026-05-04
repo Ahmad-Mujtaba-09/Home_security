@@ -87,6 +87,19 @@ async def startup():
     else:
         logger.warning("RAG service not available — run `python generate_embeddings.py` first.")
 
+    # Auto-start active devices with stream URLs
+    if supabase:
+        try:
+            resp = supabase.table("devices").select("*").eq("status", "active").execute()
+            for d in (resp.data or []):
+                url = d.get("stream_url", "")
+                if url:
+                    await device_monitor.start_device(d["device_id"], url, d["user_id"])
+            if resp.data:
+                logger.info(f"Auto-started {len(device_monitor.active_device_ids)} device monitor(s).")
+        except Exception as e:
+            logger.warning(f"Auto-start devices failed: {e}")
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -296,6 +309,189 @@ def _decode_frame(data: bytes) -> np.ndarray:
     if frame is None:
         raise ValueError("Could not decode frame")
     return frame
+
+
+# ─── Background Device Monitor ──────────────────────────────────────────────
+
+class DeviceMonitorManager:
+    """Manages background asyncio tasks that process streams from registered devices.
+
+    Each "active" device with a stream_url gets a dedicated task that:
+      - Opens cv2.VideoCapture on the stream URL
+      - Processes frames at ~2 FPS through the shared inference_system
+      - Swaps per-device tracking state in/out via save_state/load_state
+      - Logs alerts to history + notifications + FCM
+      - Updates device.last_seen periodically
+      - Reconnects on stream failure (up to 3 retries)
+    """
+
+    PROCESS_FPS = 2        # Target frames per second per device
+    LAST_SEEN_INTERVAL = 30  # Seconds between last_seen updates
+    MAX_RETRIES = 3
+    RETRY_BACKOFF = 5      # Seconds between reconnection attempts
+
+    def __init__(self):
+        self._tasks: Dict[str, asyncio.Task] = {}          # device_id → task
+        self._states: Dict[str, dict] = {}                 # device_id → saved tracking state
+        self._statuses: Dict[str, str] = {}                # device_id → "monitoring" | "error" | "connecting"
+        self._lock = asyncio.Lock()                        # Serialize model access
+        self._frame_counts: Dict[str, int] = {}
+
+    @property
+    def active_device_ids(self) -> list:
+        return list(self._tasks.keys())
+
+    def get_status(self, device_id: str) -> str:
+        if device_id in self._tasks and not self._tasks[device_id].done():
+            return self._statuses.get(device_id, "monitoring")
+        return "stopped"
+
+    async def start_device(self, device_id: str, stream_url: str, user_id: str):
+        """Start background monitoring for a device."""
+        if device_id in self._tasks and not self._tasks[device_id].done():
+            logger.info(f"Monitor already running for device {device_id}")
+            return
+
+        # Initialize per-device state
+        if device_id not in self._states:
+            if inference_system is not None:
+                inference_system.reset_state()
+                self._states[device_id] = inference_system.save_state()
+
+        self._frame_counts[device_id] = 0
+        self._statuses[device_id] = "connecting"
+        task = asyncio.create_task(
+            self._monitor_loop(device_id, stream_url, user_id)
+        )
+        self._tasks[device_id] = task
+        logger.info(f"Started monitor for device {device_id} → {stream_url}")
+
+    async def stop_device(self, device_id: str):
+        """Stop background monitoring for a device."""
+        task = self._tasks.pop(device_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._statuses.pop(device_id, None)
+        self._frame_counts.pop(device_id, None)
+        # Keep the saved state so it can resume later
+        logger.info(f"Stopped monitor for device {device_id}")
+
+    async def _monitor_loop(self, device_id: str, stream_url: str, user_id: str):
+        """Main loop for a single device monitor."""
+        retries = 0
+        frame_interval = 1.0 / self.PROCESS_FPS
+
+        while retries < self.MAX_RETRIES:
+            cap = None
+            try:
+                self._statuses[device_id] = "connecting"
+                logger.info(f"Device {device_id}: opening stream (attempt {retries + 1})")
+                cap = cv2.VideoCapture(stream_url)
+
+                if not cap.isOpened():
+                    raise ConnectionError(f"Cannot open stream: {stream_url}")
+
+                self._statuses[device_id] = "monitoring"
+                retries = 0  # Reset on successful connect
+
+                # Fetch user profile for module toggles
+                profile = _get_user_profile(user_id)
+                child_enabled = profile.get("child_module_enabled", True)
+                elderly_enabled = profile.get("elderly_module_enabled", True)
+
+                fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+                last_seen_time = 0
+                import time
+
+                while True:
+                    loop_start = time.monotonic()
+
+                    ret, frame = cap.read()
+                    if not ret:
+                        logger.warning(f"Device {device_id}: frame read failed")
+                        break
+
+                    if inference_system is None:
+                        await asyncio.sleep(1)
+                        continue
+
+                    frame_idx = self._frame_counts.get(device_id, 0)
+
+                    # Swap in per-device state, process, swap out
+                    async with self._lock:
+                        saved = self._states.get(device_id)
+                        if saved:
+                            inference_system.load_state(saved)
+                        inference_system.child_enabled = child_enabled
+                        inference_system.elderly_enabled = elderly_enabled
+                        inference_system.camera_mode = "cctv"  # Background devices are typically fixed cameras
+                        inference_system.fps = fps
+
+                        _, alerts, _ = inference_system.process_frame(frame, frame_idx)
+                        self._states[device_id] = inference_system.save_state()
+
+                    # Log alerts
+                    for a in alerts:
+                        _log_event(user_id, a)
+
+                    self._frame_counts[device_id] = frame_idx + 1
+
+                    # Update last_seen periodically
+                    now = time.monotonic()
+                    if now - last_seen_time > self.LAST_SEEN_INTERVAL:
+                        last_seen_time = now
+                        try:
+                            if supabase:
+                                supabase.table("devices").update({
+                                    "last_seen": datetime.now(timezone.utc).isoformat(),
+                                    "status": "active",
+                                }).eq("device_id", device_id).execute()
+                        except Exception as e:
+                            logger.warning(f"Device {device_id}: last_seen update failed: {e}")
+
+                    # Refresh profile every 300 frames
+                    if frame_idx % 300 == 0 and frame_idx > 0:
+                        profile = _get_user_profile(user_id)
+                        child_enabled = profile.get("child_module_enabled", True)
+                        elderly_enabled = profile.get("elderly_module_enabled", True)
+
+                    # Throttle to target FPS
+                    elapsed = time.monotonic() - loop_start
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        await asyncio.sleep(0)  # Yield to event loop
+
+            except asyncio.CancelledError:
+                logger.info(f"Device {device_id}: monitor cancelled")
+                break
+            except Exception as e:
+                retries += 1
+                logger.error(f"Device {device_id}: error ({retries}/{self.MAX_RETRIES}): {e}")
+                self._statuses[device_id] = "error"
+                if retries < self.MAX_RETRIES:
+                    await asyncio.sleep(self.RETRY_BACKOFF * retries)
+            finally:
+                if cap is not None:
+                    cap.release()
+
+        # Permanent failure — mark offline
+        self._statuses[device_id] = "stopped"
+        self._tasks.pop(device_id, None)
+        try:
+            if supabase:
+                supabase.table("devices").update({"status": "offline"}).eq("device_id", device_id).execute()
+        except Exception:
+            pass
+        logger.warning(f"Device {device_id}: monitor stopped permanently")
+
+
+device_monitor = DeviceMonitorManager()
 
 
 # ─── REST endpoints ──────────────────────────────────────────────────────────
@@ -908,7 +1104,11 @@ async def create_device(request: Request):
         "status":      body.get("status", "inactive"),
     }
     resp = supabase.table("devices").insert(row).execute()
-    return {"data": (resp.data or [None])[0]}
+    created = (resp.data or [None])[0]
+    # Auto-start if active with a stream URL
+    if created and created.get("status") == "active" and created.get("stream_url"):
+        await device_monitor.start_device(created["device_id"], created["stream_url"], created["user_id"])
+    return {"data": created}
 
 
 @app.patch("/api/devices/{device_id}")
@@ -921,15 +1121,57 @@ async def update_device(device_id: str, request: Request):
     if not patch:
         raise HTTPException(400, "No updatable fields provided")
     resp = supabase.table("devices").update(patch).eq("device_id", device_id).execute()
-    return {"data": (resp.data or [None])[0]}
+    updated = (resp.data or [None])[0]
+    # Start/stop monitor based on status change
+    if updated and "status" in patch:
+        if patch["status"] == "active" and updated.get("stream_url"):
+            await device_monitor.start_device(device_id, updated["stream_url"], updated["user_id"])
+        elif patch["status"] in ("inactive", "offline"):
+            await device_monitor.stop_device(device_id)
+    return {"data": updated}
 
 
 @app.delete("/api/devices/{device_id}")
 async def delete_device(device_id: str):
     if supabase is None:
         raise HTTPException(503, "Database not configured")
+    await device_monitor.stop_device(device_id)
     supabase.table("devices").delete().eq("device_id", device_id).execute()
     return {"status": "deleted"}
+
+
+@app.post("/api/devices/{device_id}/start")
+async def start_device_monitor(device_id: str):
+    """Start background monitoring for a device."""
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    resp = supabase.table("devices").select("*").eq("device_id", device_id).execute()
+    if not resp.data:
+        raise HTTPException(404, "Device not found")
+    d = resp.data[0]
+    if not d.get("stream_url"):
+        raise HTTPException(400, "Device has no stream_url configured")
+    await device_monitor.start_device(device_id, d["stream_url"], d["user_id"])
+    supabase.table("devices").update({"status": "active"}).eq("device_id", device_id).execute()
+    return {"status": "started", "device_id": device_id}
+
+
+@app.post("/api/devices/{device_id}/stop")
+async def stop_device_monitor(device_id: str):
+    """Stop background monitoring for a device."""
+    await device_monitor.stop_device(device_id)
+    if supabase:
+        supabase.table("devices").update({"status": "inactive"}).eq("device_id", device_id).execute()
+    return {"status": "stopped", "device_id": device_id}
+
+
+@app.get("/api/devices/{device_id}/status")
+async def get_device_monitor_status(device_id: str):
+    """Get the monitoring status of a device."""
+    return {
+        "device_id": device_id,
+        "monitor_status": device_monitor.get_status(device_id),
+    }
 
 
 # ─── Notifications ───────────────────────────────────────────────────────────

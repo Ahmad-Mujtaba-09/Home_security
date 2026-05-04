@@ -140,6 +140,7 @@ class _DevicesScreenState extends State<DevicesScreen> {
                       device: _devices[i],
                       onEdit: () => _openEditor(existing: _devices[i]),
                       onDelete: () => _delete(_devices[i]),
+                      onStatusChanged: _refresh,
                     ),
                   ),
                 ),
@@ -147,44 +148,92 @@ class _DevicesScreenState extends State<DevicesScreen> {
   }
 }
 
-class _DeviceCard extends StatelessWidget {
+class _DeviceCard extends StatefulWidget {
   final Device device;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
+  final VoidCallback onStatusChanged;
 
   const _DeviceCard({
     required this.device,
     required this.onEdit,
     required this.onDelete,
+    required this.onStatusChanged,
   });
 
+  @override
+  State<_DeviceCard> createState() => _DeviceCardState();
+}
+
+class _DeviceCardState extends State<_DeviceCard> {
+  String _monitorStatus = 'stopped';
+  bool _toggling = false;
+
+  Device get device => widget.device;
+
+  @override
+  void initState() {
+    super.initState();
+    _pollStatus();
+  }
+
+  Future<void> _pollStatus() async {
+    final status = await ApiService.getDeviceMonitorStatus(device.deviceId);
+    if (mounted) setState(() => _monitorStatus = status);
+  }
+
+  Future<void> _toggleMonitor() async {
+    setState(() => _toggling = true);
+    bool ok;
+    if (_monitorStatus == 'monitoring' || _monitorStatus == 'connecting') {
+      ok = await ApiService.stopDeviceMonitor(device.deviceId);
+      if (ok && mounted) setState(() => _monitorStatus = 'stopped');
+    } else {
+      ok = await ApiService.startDeviceMonitor(device.deviceId);
+      if (ok && mounted) setState(() => _monitorStatus = 'connecting');
+      await Future.delayed(const Duration(seconds: 2));
+      await _pollStatus();
+    }
+    if (mounted) setState(() => _toggling = false);
+    widget.onStatusChanged();
+  }
+
   Color _statusColor() {
-    switch (device.status) {
-      case 'active':
-        return AppColors.accentGreen;
-      case 'offline':
-        return AppColors.danger;
+    switch (_monitorStatus) {
+      case 'monitoring': return AppColors.accentGreen;
+      case 'connecting': return AppColors.warning;
+      case 'error': return AppColors.danger;
       default:
-        return AppColors.warning;
+        if (device.status == 'active') return AppColors.accentGreen;
+        if (device.status == 'offline') return AppColors.danger;
+        return Colors.grey;
+    }
+  }
+
+  String _statusLabel() {
+    switch (_monitorStatus) {
+      case 'monitoring': return 'Monitoring';
+      case 'connecting': return 'Connecting…';
+      case 'error': return 'Error';
+      default: return device.status;
     }
   }
 
   IconData _typeIcon() {
     switch (device.deviceType) {
-      case 'rtsp':
-        return Icons.stream;
-      case 'mobile':
-        return Icons.phone_android;
-      case 'camera':
-        return Icons.videocam_outlined;
-      default:
-        return Icons.devices_other;
+      case 'rtsp': return Icons.stream;
+      case 'mobile': return Icons.phone_android;
+      case 'camera': return Icons.videocam_outlined;
+      default: return Icons.devices_other;
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final hasStream = device.streamUrl != null && device.streamUrl!.isNotEmpty;
+    final isRunning = _monitorStatus == 'monitoring' || _monitorStatus == 'connecting';
+
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
@@ -192,76 +241,84 @@ class _DeviceCard extends StatelessWidget {
         color: isDark ? AppColors.darkCard : AppColors.lightCard,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isDark ? AppColors.darkBorder : AppColors.lightBorder,
+          color: isRunning
+              ? AppColors.accentGreen.withValues(alpha: 0.4)
+              : (isDark ? AppColors.darkBorder : AppColors.lightBorder),
         ),
       ),
-      child: Row(
+      child: Column(
         children: [
-          Container(
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(
-              color: AppColors.accentPrimary.withValues(alpha: 0.15),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Icon(_typeIcon(), color: AppColors.accentPrimary),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  device.deviceName,
-                  style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          Row(
+            children: [
+              Container(
+                width: 44, height: 44,
+                decoration: BoxDecoration(
+                  color: AppColors.accentPrimary.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(12),
                 ),
-                const SizedBox(height: 4),
-                Row(
+                child: Icon(_typeIcon(), color: AppColors.accentPrimary),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Container(
-                      width: 8,
-                      height: 8,
-                      decoration: BoxDecoration(
-                        color: _statusColor(),
-                        shape: BoxShape.circle,
+                    Text(device.deviceName,
+                        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 4),
+                    Row(children: [
+                      Container(
+                        width: 8, height: 8,
+                        decoration: BoxDecoration(color: _statusColor(), shape: BoxShape.circle),
                       ),
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      device.status,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: isDark ? Colors.white60 : Colors.black54,
-                      ),
-                    ),
-                    if (device.location != null && device.location!.isNotEmpty) ...[
-                      const SizedBox(width: 10),
-                      Icon(Icons.place_outlined,
-                          size: 12, color: isDark ? Colors.white38 : Colors.black38),
-                      const SizedBox(width: 2),
-                      Flexible(
-                        child: Text(
-                          device.location!,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: isDark ? Colors.white60 : Colors.black54,
-                          ),
+                      const SizedBox(width: 6),
+                      Text(_statusLabel(),
+                          style: TextStyle(fontSize: 12, color: isDark ? Colors.white60 : Colors.black54)),
+                      if (device.location != null && device.location!.isNotEmpty) ...[
+                        const SizedBox(width: 10),
+                        Icon(Icons.place_outlined, size: 12, color: isDark ? Colors.white38 : Colors.black38),
+                        const SizedBox(width: 2),
+                        Flexible(
+                          child: Text(device.location!, overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 12, color: isDark ? Colors.white60 : Colors.black54)),
                         ),
-                      ),
-                    ],
+                      ],
+                    ]),
                   ],
                 ),
-              ],
-            ),
-          ),
-          PopupMenuButton<String>(
-            onSelected: (v) => v == 'edit' ? onEdit() : onDelete(),
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'edit', child: Text('Edit')),
-              PopupMenuItem(value: 'delete', child: Text('Delete')),
+              ),
+              PopupMenuButton<String>(
+                onSelected: (v) => v == 'edit' ? widget.onEdit() : widget.onDelete(),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'edit', child: Text('Edit')),
+                  PopupMenuItem(value: 'delete', child: Text('Delete')),
+                ],
+              ),
             ],
           ),
+          if (hasStream) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity, height: 38,
+              child: _toggling
+                  ? const Center(child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)))
+                  : OutlinedButton.icon(
+                      onPressed: _toggleMonitor,
+                      icon: Icon(
+                        isRunning ? Icons.stop_circle_outlined : Icons.play_circle_outlined,
+                        size: 18, color: isRunning ? AppColors.danger : AppColors.accentGreen,
+                      ),
+                      label: Text(
+                        isRunning ? 'Stop monitoring' : 'Start monitoring',
+                        style: TextStyle(fontSize: 13, color: isRunning ? AppColors.danger : AppColors.accentGreen),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(color: (isRunning ? AppColors.danger : AppColors.accentGreen).withValues(alpha: 0.4)),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                    ),
+            ),
+          ],
         ],
       ),
     );

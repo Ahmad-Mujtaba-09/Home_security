@@ -862,6 +862,50 @@ class HomeSafetyInference:
         """
         self._init_state_dicts()
 
+    def save_state(self) -> dict:
+        """Snapshot all mutable per-stream tracking state into a plain dict.
+
+        Used by DeviceMonitorManager to swap state between devices that share
+        the same HomeSafetyInference instance (and thus the same YOLO models).
+        """
+        return {
+            "kp_buffers": self.kp_buffers,
+            "person_status": self.person_status,
+            "person_type_hist": self.person_type_hist,
+            "lost_patience": self.lost_patience,
+            "fall_start_time": self.fall_start_time,
+            "alarm_fired": self.alarm_fired,
+            "inverted_count": self.inverted_count,
+            "cached_tcn": self.cached_tcn,
+            "fps": self.fps,
+            "_hazard_history": self._hazard_history,
+            "_hazard_miss_count": self._hazard_miss_count,
+            "child_score_hist": self.child_score_hist,
+            "heuristic_prev_kp": self.heuristic.prev_kp.copy(),
+            "heuristic_prev_cog": self.heuristic.prev_cog.copy(),
+            "heuristic_deb_count": self.heuristic.deb_count.copy(),
+            "heuristic_prev_state": self.heuristic.prev_state.copy(),
+        }
+
+    def load_state(self, state: dict) -> None:
+        """Restore tracking state from a snapshot produced by save_state()."""
+        self.kp_buffers = state["kp_buffers"]
+        self.person_status = state["person_status"]
+        self.person_type_hist = state["person_type_hist"]
+        self.lost_patience = state["lost_patience"]
+        self.fall_start_time = state["fall_start_time"]
+        self.alarm_fired = state["alarm_fired"]
+        self.inverted_count = state["inverted_count"]
+        self.cached_tcn = state["cached_tcn"]
+        self.fps = state["fps"]
+        self._hazard_history = state["_hazard_history"]
+        self._hazard_miss_count = state["_hazard_miss_count"]
+        self.child_score_hist = state["child_score_hist"]
+        self.heuristic.prev_kp = state["heuristic_prev_kp"]
+        self.heuristic.prev_cog = state["heuristic_prev_cog"]
+        self.heuristic.deb_count = state["heuristic_deb_count"]
+        self.heuristic.prev_state = state["heuristic_prev_state"]
+
     # ── Per-person helpers ────────────────────────────────────────────────────
 
     def _smooth_type(self, tid: int, raw_type: str, flip_threshold: int = 15) -> str:

@@ -175,3 +175,96 @@ class TestClassifyPersonType:
         kp[fd.KP_R_SHOULDER] = np.array([110.0, 199.0])
         label, _ = fd.classify_person_type(kp, frame_h=480, camera_mode="mobile")
         assert label == "UNKNOWN"
+
+
+# ─── save_state / load_state ──────────────────────────────────────────────
+
+class TestSaveLoadState:
+    """Verify the state swap mechanism used by DeviceMonitorManager."""
+
+    @pytest.fixture
+    def system(self, tmp_path):
+        """Create a minimal HomeSafetyInference without real weights."""
+        # We need to mock model loading since we don't have weight files.
+        from unittest.mock import patch, MagicMock
+        import torch
+
+        fake_yolo = MagicMock()
+        fake_tcn_weights = tmp_path / "tcn.pt"
+        fake_mean = tmp_path / "mean.npy"
+        fake_std = tmp_path / "std.npy"
+
+        # Create dummy weight files
+        torch.save(fd.TCN().state_dict(), str(fake_tcn_weights))
+        np.save(str(fake_mean), np.zeros(fd.FEATURE_DIM))
+        np.save(str(fake_std), np.ones(fd.FEATURE_DIM))
+
+        with patch.object(fd, "YOLO", return_value=fake_yolo):
+            sys = fd.HomeSafetyInference(
+                tcn_weights=str(fake_tcn_weights),
+                norm_mean=str(fake_mean),
+                norm_std=str(fake_std),
+                hazard_weights="dummy.pt",
+                mode="hybrid",
+            )
+        return sys
+
+    def test_save_returns_dict_with_expected_keys(self, system):
+        state = system.save_state()
+        expected_keys = {
+            "kp_buffers", "person_status", "person_type_hist",
+            "lost_patience", "fall_start_time", "alarm_fired",
+            "inverted_count", "cached_tcn", "fps",
+            "_hazard_history", "_hazard_miss_count", "child_score_hist",
+            "heuristic_prev_kp", "heuristic_prev_cog",
+            "heuristic_deb_count", "heuristic_prev_state",
+        }
+        assert set(state.keys()) == expected_keys
+
+    def test_save_load_roundtrip_preserves_state(self, system):
+        # Mutate some tracking state.
+        system.kp_buffers[42] = "test_buffer"
+        system.cached_tcn[42] = 0.75
+        system.heuristic.prev_state[42] = "FALL"
+        system.fps = 15
+
+        snapshot = system.save_state()
+
+        # Reset to clean state.
+        system.reset_state()
+        assert system.kp_buffers == {}
+        assert system.cached_tcn == {}
+
+        # Restore from snapshot.
+        system.load_state(snapshot)
+        assert system.kp_buffers[42] == "test_buffer"
+        assert system.cached_tcn[42] == 0.75
+        assert system.heuristic.prev_state[42] == "FALL"
+        assert system.fps == 15
+
+    def test_multiple_device_states_independent(self, system):
+        """Simulate two devices swapping state through the same system."""
+        # Device A state
+        system.reset_state()
+        system.cached_tcn[1] = 0.9
+        system.heuristic.prev_state[1] = "FALL"
+        state_a = system.save_state()
+
+        # Device B state
+        system.reset_state()
+        system.cached_tcn[2] = 0.1
+        system.heuristic.prev_state[2] = "STANDING"
+        state_b = system.save_state()
+
+        # Restore A — should not contain B's data.
+        system.load_state(state_a)
+        assert 1 in system.cached_tcn
+        assert 2 not in system.cached_tcn
+        assert system.heuristic.prev_state[1] == "FALL"
+
+        # Restore B — should not contain A's data.
+        system.load_state(state_b)
+        assert 2 in system.cached_tcn
+        assert 1 not in system.cached_tcn
+        assert system.heuristic.prev_state[2] == "STANDING"
+

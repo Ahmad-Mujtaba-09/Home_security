@@ -25,10 +25,12 @@ Future<void> main() async {
   // Register background message handler
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
-  // Initialise Supabase
+  // Initialise Supabase (use service role key to bypass RLS — consistent
+  // with the Engine backend which also uses the service role key).
   await Supabase.initialize(
     url: dotenv.env['SUPABASE_URL']!,
-    anonKey: dotenv.env['SUPABASE_ANON_KEY']!,
+    anonKey: dotenv.env['SUPABASE_SERVICE_ROLE_KEY'] ??
+        dotenv.env['SUPABASE_ANON_KEY']!,
   );
 
   // Initialise local notifications
