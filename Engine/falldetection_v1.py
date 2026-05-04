@@ -481,11 +481,33 @@ def classify_person_type(
     kp: List,
     p_bbox: Optional[Tuple] = None,
     frame_h: Optional[int] = None,
-    ratio_thr: float = 0.75,
-    infant_thr: float = 0.85,
-    small_frac: float = 0.35,
+    child_thr: float = 0.55,
 ) -> Tuple[str, Optional[float]]:
-    """ADULT / CHILD / UNKNOWN via leg-to-torso ratio (scale-invariant)."""
+    """
+    ADULT / CHILD / UNKNOWN via body-axis-projected proportion scoring.
+
+    All proportions are measured along the **spine direction** (hip→shoulder
+    vector), not along the image y-axis. Projecting keypoints onto the spine
+    gives anatomical lengths that are invariant to body orientation — works
+    whether the person is standing, walking, bending forward, or sitting —
+    and to face direction (head protrusion is perpendicular to the spine, so
+    it cancels in projection).
+
+    Cues (all scale-invariant, projected onto body axis):
+        head_h / body_h  — primary,   weight 0.65
+        head_h / torso_h — secondary, weight 0.35
+
+    Leg/torso is intentionally omitted: it peaks around age 5–7 (children of
+    that age have proportionally longer legs than adults), so a high ratio
+    can mean either child or adult — ambiguous, removed.
+
+    Returns (label, child_score) where child_score ∈ [0,1], 1 = clearly child.
+    Returns UNKNOWN when keypoints are insufficient or pose is too foreshortened
+    to measure reliably; _smooth_type preserves the last confident label.
+
+    p_bbox and frame_h are accepted for backwards compatibility but unused.
+    """
+    nose = _gkp(kp, KP_NOSE)
     ls = _gkp(kp, KP_L_SHOULDER)
     rs = _gkp(kp, KP_R_SHOULDER)
     lh = _gkp(kp, KP_L_HIP)
@@ -493,39 +515,65 @@ def classify_person_type(
     la = _gkp(kp, KP_L_ANKLE)
     ra = _gkp(kp, KP_R_ANKLE)
 
-    thr = ratio_thr
-    if p_bbox is not None and frame_h is not None:
-        # FIX 9: guard against zero-height bboxes setting thr=infant_thr
-        # (happens when all keypoints land at the same y-coordinate).
-        # Require bbox to have at least 1% of frame height before comparing.
-        bbox_h_frac = (p_bbox[3] - p_bbox[1]) / frame_h
-        if 0.01 < bbox_h_frac < small_frac:
-            thr = infant_thr
+    def _mid(a, b):
+        if a is None and b is None:
+            return None
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return (a + b) / 2.0
 
-    # Primary: leg / torso ratio
-    if all(v is not None for v in [ls, rs, lh, rh, la, ra]):
-        hip = (lh + rh) / 2
-        sh = (ls + rs) / 2
-        ank = (la + ra) / 2
-        torso = float(np.linalg.norm(hip - sh))
-        leg = float(np.linalg.norm(ank - hip))
-        if torso > 5.0:
-            return ("CHILD" if leg / torso < thr else "ADULT"), round(leg / torso, 3)
+    sh = _mid(ls, rs)
+    hip = _mid(lh, rh)
+    ank = _mid(la, ra)
 
-    # Fallback: shoulder-width / torso ratio
-    # NOTE: This fallback is unreliable for CHILD detection (fallen adults
-    # with hidden legs trigger false CHILD classifications). Return UNKNOWN
-    # and let _smooth_type preserve the last confident classification.
-    if all(v is not None for v in [ls, rs, lh, rh]):
-        sh = (ls + rs) / 2
-        hip = (lh + rh) / 2
-        sw = float(np.linalg.norm(ls - rs))
-        torso = float(np.linalg.norm(hip - sh))
-        if torso > 5.0:
-            r = sw / torso
-            return "UNKNOWN", round(r, 3)
+    if nose is None or sh is None or hip is None:
+        return "UNKNOWN", None
 
-    return "UNKNOWN", None
+    # Spine vector defines the body's local "up" direction.
+    spine = sh - hip
+    torso_h = float(np.linalg.norm(spine))
+    if torso_h < 10.0:
+        # Too short in image — heavy foreshortening or bad keypoints
+        return "UNKNOWN", None
+    unit_spine = spine / torso_h
+
+    # Head extension above shoulders along the spine.
+    head_h = float(np.dot(nose - sh, unit_spine))
+    if head_h <= 3.0:
+        # Head not extending along spine direction — chin tucked, head down,
+        # or pose unparseable. Bail and let the sticky smoother hold.
+        return "UNKNOWN", None
+
+    scores: List[Tuple[float, float]] = []  # (cue_score in [0,1], weight)
+
+    # PRIMARY: head height / total body length along spine.
+    # body_h = head + torso + leg projections.
+    # Anthropometric: adult ~0.09 · 6y ~0.13 · 2y ~0.16 (ratios derived from
+    # 8/6/5 head-counts respectively).
+    if ank is not None:
+        leg_proj = float(np.dot(hip - ank, unit_spine))
+        if leg_proj > 5.0:  # legs aligned with spine (i.e. body roughly straight)
+            body_h = head_h + torso_h + leg_proj
+            r = head_h / body_h
+            s = float(np.clip((r - 0.095) / (0.140 - 0.095), 0.0, 1.0))
+            scores.append((s, 0.65))
+
+    # SECONDARY: head height / torso height (always available given we have
+    # nose, shoulders, hips). Adult ~0.28 · 6y ~0.45 · 2y ~0.50.
+    r = head_h / torso_h
+    s = float(np.clip((r - 0.30) / (0.46 - 0.30), 0.0, 1.0))
+    scores.append((s, 0.35))
+
+    if not scores:
+        return "UNKNOWN", None
+
+    total_w = sum(w for _, w in scores)
+    child_score = sum(s * w for s, w in scores) / total_w
+
+    label = "CHILD" if child_score >= child_thr else "ADULT"
+    return label, round(child_score, 3)
 
 
 def kp_to_bbox(
