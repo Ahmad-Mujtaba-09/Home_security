@@ -13,7 +13,7 @@ import logging
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -106,8 +106,16 @@ def _get_user_profile(user_id: str) -> Dict:
     return defaults
 
 
+def _alert_title_body(alert: Dict) -> Tuple[str, str]:
+    event_type = alert.get("type", "UNKNOWN")
+    confidence = alert.get("prob", 0) or 0
+    title = f"⚠️ {event_type.replace('_', ' ').title()} Detected"
+    body = f"Confidence: {confidence:.0%}. Check the app for details."
+    return title, body
+
+
 def _log_event(user_id: str, alert: Dict):
-    """Write a detection event to the Supabase history table and send FCM push."""
+    """Write a detection event to history, persist a notification row, push FCM."""
     if supabase is None:
         return
     try:
@@ -117,7 +125,22 @@ def _log_event(user_id: str, alert: Dict):
             "confidence": alert.get("prob"),
             "frame_count": alert.get("frame"),
         }
-        supabase.table("history").insert(row).execute()
+        resp = supabase.table("history").insert(row).execute()
+        event_id = (resp.data or [{}])[0].get("id") if getattr(resp, "data", None) else None
+
+        # Persist notification record (decoupled from FCM throttling — every
+        # alert produces a notification row so the in-app history is complete).
+        try:
+            title, body = _alert_title_body(alert)
+            supabase.table("notifications").insert({
+                "user_id": user_id,
+                "event_id": event_id,
+                "title": title,
+                "message": body,
+                "notification_type": alert.get("type", "alert"),
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Failed to insert notification: {e}")
 
         # Send FCM push notification (throttled)
         _send_fcm_push(user_id, alert)
@@ -761,7 +784,24 @@ async def gemini_report(user_id: str = Query(...)):
             )
             resp.raise_for_status()
             body = resp.json()
-            return {"report": body["choices"][0]["message"]["content"]}
+            report_text = body["choices"][0]["message"]["content"]
+
+            # Cache the generated summary so the UI can replay history without
+            # re-billing Groq. Best-effort — never fail the request on this.
+            try:
+                start_iso = incidents[0]["start"].isoformat() if incidents else cutoff
+                end_iso = incidents[-1]["end"].isoformat() if incidents else datetime.now(timezone.utc).isoformat()
+                supabase.table("incident_summaries").insert({
+                    "user_id": user_id,
+                    "start_time": start_iso,
+                    "end_time": end_iso,
+                    "summary_text": report_text,
+                    "incident_count": len(incidents),
+                }).execute()
+            except Exception as e:
+                logger.warning(f"Failed to cache incident summary: {e}")
+
+            return {"report": report_text}
     except Exception as e:
         logger.error(f"Groq API error: {e}")
         return {"report": f"⚠️ Could not generate report: {e}"}
@@ -773,26 +813,202 @@ async def gemini_report(user_id: str = Query(...)):
 async def chat(request: Request):
     """
     RAG-powered First Aid chatbot endpoint.
-    Expects JSON: {"message": str, "user_id": str, "history": [{"role": str, "text": str}, ...]}
-    Returns JSON: {"reply": str, "sources": [{"book": str, "page": int}, ...]}
+    Expects JSON:
+        {
+            "message": str,
+            "user_id": str,
+            "session_id": str | null,   # optional — server creates one if absent
+            "history": [{"role": str, "text": str}, ...]
+        }
+    Returns JSON:
+        {"reply": str, "sources": [...], "session_id": str}
     """
     body = await request.json()
     user_message = body.get("message", "").strip()
     chat_history = body.get("history", [])
+    user_id = body.get("user_id", "")
+    session_id = body.get("session_id")
 
     if not user_message:
-        return {"reply": "Please enter a message.", "sources": []}
+        return {"reply": "Please enter a message.", "sources": [], "session_id": session_id}
 
     if rag_service is None or not rag_service.ready:
-        # Fallback: if RAG not loaded, return a helpful error
         return {
             "reply": "⚠️ The First Aid knowledge base is not loaded. "
                      "Please run `python generate_embeddings.py` to build the index.",
-            "sources": []
+            "sources": [],
+            "session_id": session_id,
         }
 
+    # Ensure a chat session exists for this exchange.
+    if supabase is not None and user_id:
+        try:
+            if not session_id:
+                resp = supabase.table("chat_sessions").insert({
+                    "user_id": user_id,
+                    "title": user_message[:60],
+                }).execute()
+                session_id = (resp.data or [{}])[0].get("session_id")
+
+            if session_id:
+                supabase.table("chat_messages").insert({
+                    "session_id": session_id,
+                    "sender": "user",
+                    "message_text": user_message,
+                }).execute()
+        except Exception as e:
+            logger.warning(f"Chat session persistence failed: {e}")
+
     result = await rag_service.query(user_message, chat_history)
+
+    if supabase is not None and session_id:
+        try:
+            supabase.table("chat_messages").insert({
+                "session_id": session_id,
+                "sender": "bot",
+                "message_text": result.get("reply", ""),
+                "sources": result.get("sources", []),
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Bot message persistence failed: {e}")
+
+    result["session_id"] = session_id
     return result
+
+
+# ─── Devices CRUD ────────────────────────────────────────────────────────────
+
+@app.get("/api/devices")
+async def list_devices(user_id: str = Query(...)):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    resp = (
+        supabase.table("devices")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"data": resp.data or []}
+
+
+@app.post("/api/devices")
+async def create_device(request: Request):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    body = await request.json()
+    if not body.get("user_id") or not body.get("device_name"):
+        raise HTTPException(400, "user_id and device_name are required")
+    row = {
+        "user_id":     body["user_id"],
+        "device_name": body["device_name"],
+        "device_type": body.get("device_type", "camera"),
+        "stream_url":  body.get("stream_url"),
+        "location":    body.get("location"),
+        "status":      body.get("status", "inactive"),
+    }
+    resp = supabase.table("devices").insert(row).execute()
+    return {"data": (resp.data or [None])[0]}
+
+
+@app.patch("/api/devices/{device_id}")
+async def update_device(device_id: str, request: Request):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    body = await request.json()
+    allowed = {"device_name", "device_type", "stream_url", "location", "status", "last_seen"}
+    patch = {k: v for k, v in body.items() if k in allowed}
+    if not patch:
+        raise HTTPException(400, "No updatable fields provided")
+    resp = supabase.table("devices").update(patch).eq("device_id", device_id).execute()
+    return {"data": (resp.data or [None])[0]}
+
+
+@app.delete("/api/devices/{device_id}")
+async def delete_device(device_id: str):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    supabase.table("devices").delete().eq("device_id", device_id).execute()
+    return {"status": "deleted"}
+
+
+# ─── Notifications ───────────────────────────────────────────────────────────
+
+@app.get("/api/notifications")
+async def list_notifications(
+    user_id: str = Query(...),
+    unread_only: bool = Query(False),
+    limit: int = Query(100),
+):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    q = supabase.table("notifications").select("*").eq("user_id", user_id)
+    if unread_only:
+        q = q.eq("read_status", False)
+    resp = q.order("sent_at", desc=True).limit(limit).execute()
+    return {"data": resp.data or []}
+
+
+@app.patch("/api/notifications/{notification_id}")
+async def mark_notification_read(notification_id: str, request: Request):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    body = await request.json()
+    read = bool(body.get("read_status", True))
+    resp = (
+        supabase.table("notifications")
+        .update({"read_status": read})
+        .eq("notification_id", notification_id)
+        .execute()
+    )
+    return {"data": (resp.data or [None])[0]}
+
+
+# ─── Incident summaries (cached Gemini reports) ──────────────────────────────
+
+@app.get("/api/summaries")
+async def list_summaries(user_id: str = Query(...), limit: int = Query(50)):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    resp = (
+        supabase.table("incident_summaries")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("generated_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return {"data": resp.data or []}
+
+
+# ─── Chat history ────────────────────────────────────────────────────────────
+
+@app.get("/api/chat/sessions")
+async def list_chat_sessions(user_id: str = Query(...)):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    resp = (
+        supabase.table("chat_sessions")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("started_at", desc=True)
+        .execute()
+    )
+    return {"data": resp.data or []}
+
+
+@app.get("/api/chat/sessions/{session_id}/messages")
+async def list_chat_messages(session_id: str):
+    if supabase is None:
+        raise HTTPException(503, "Database not configured")
+    resp = (
+        supabase.table("chat_messages")
+        .select("*")
+        .eq("session_id", session_id)
+        .order("timestamp", desc=False)
+        .execute()
+    )
+    return {"data": resp.data or []}
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

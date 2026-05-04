@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import '../../core/app_colors.dart';
 import '../../data/api_service.dart';
 import '../../data/supabase_service.dart';
+import 'summaries_history_screen.dart';
 
 /// AI Summary screen with a prominent generation card and result display.
 class SummaryScreen extends StatefulWidget {
@@ -200,6 +201,38 @@ class _SummaryScreenState extends State<SummaryScreen>
                   ],
                 ),
               ),
+
+            // ── Past summaries link ───────────────────────────────────────
+            const SizedBox(height: 16),
+            GestureDetector(
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const SummariesHistoryScreen()),
+              ),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                decoration: BoxDecoration(
+                  color: isDark ? AppColors.darkCard : AppColors.lightCard,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: isDark ? AppColors.darkBorder : AppColors.lightBorder,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.history, size: 20, color: AppColors.accentPrimary),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text('View Past Summaries',
+                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+                    ),
+                    Icon(Icons.chevron_right, size: 20,
+                        color: isDark ? Colors.white30 : Colors.black26),
+                  ],
+                ),
+              ),
+            ),
           ],
         ),
       ),
