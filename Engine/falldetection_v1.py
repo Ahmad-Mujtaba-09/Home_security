@@ -76,7 +76,7 @@ COG_WEIGHTS = {
 }
 
 HAZARD_NAMES = {0: "knife", 1: "fire", 2: "stairs", 3: "oven", 4: "stove"}
-HAZARD_CONF = {"knife": 0.40, "fire": 0.50, "stairs": 0.30, "oven": 0.25, "stove": 0.25}
+HAZARD_CONF = {"knife": 0.35, "fire": 0.50, "stairs": 0.30, "oven": 0.40, "stove": 0.40}
 HAZARD_PROXIMITY = {
     "knife": 0.18,
     "fire": 0.30,
@@ -89,7 +89,7 @@ COLOR = {
     "FALL": (0, 0, 255),
     "FALLING": (0, 60, 255),
     "PRE_FALL": (0, 30, 255),
-    "STANDING": (0, 255, 0),
+    "STANDING": (255, 255, 0),
     "CHILD": (255, 105, 180),
     "HAZARD": (0, 165, 255),
     "ALERT": (0, 0, 255),
@@ -477,35 +477,65 @@ class HeuristicClassifier:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── Calibration profiles per camera mode ──────────────────────────────────────
+# Each profile: (adult_boundary, child_boundary, weight) per cue.
+#
+# `margin` defines a deadband around `thr`:
+#   score >= thr + margin → CHILD
+#   score <= thr - margin → ADULT
+#   else                  → UNKNOWN  (sticky lock holds the prior label)
+# This makes classification robust to errors in the per-cue boundaries:
+# a small offset shifts borderline scores into the deadband (UNKNOWN)
+# rather than flipping them to the wrong class.
+_CALIB = {
+    "mobile": {
+        # Calibrated from eye-level webcam/mobile data.
+        "cue1": {"adult": 0.12, "child": 0.18, "w": 0.15},   # head/body
+        "cue2": {"adult": 0.35, "child": 0.60, "w": 0.10},   # head/torso
+        "cue3": {"adult": 1.30, "child": 0.85, "w": 0.35},   # leg/torso (inverted)
+        "cue4": {"adult": 0.20, "child": 0.30, "w": 0.15},   # sh_w/body
+        "cue5": {"adult": 0.48, "child": 0.58, "w": 0.25},   # upper/body
+        "thr": 0.45,
+        "margin": 0.0,    # mobile: original behavior, no deadband
+        "min_cues": 1,    # mobile: classify whenever any cue is available
+    },
+    "cctv": {
+        # CCTV cameras are typically elevated (2–3m), looking down.
+        # Ankles are often hidden by foreshortening or scene clutter,
+        # which kills cues 1, 3, 4, 5 (all need leg projection). To keep
+        # classification working when only head/torso + one or two others
+        # are available, we lower min_cues to 2 here.
+        # NOTE: these boundaries are estimated, not measured. Use the
+        # deadband to absorb small calibration errors, but keep it narrow
+        # so true children don't get swallowed into UNKNOWN.
+        "cue1": {"adult": 0.10, "child": 0.15, "w": 0.30},   # head/body
+        "cue2": {"adult": 0.30, "child": 0.50, "w": 0.20},   # head/torso
+        "cue3": {"adult": 1.40, "child": 0.80, "w": 0.15},   # leg/torso (unreliable from above)
+        "cue4": {"adult": 0.18, "child": 0.30, "w": 0.15},   # sh_w/body
+        "cue5": {"adult": 0.45, "child": 0.58, "w": 0.20},   # upper/body
+        "thr": 0.45,
+        "margin": 0.04,
+        "min_cues": 2,
+    },
+}
+
+
 def classify_person_type(
     kp: List,
     p_bbox: Optional[Tuple] = None,
     frame_h: Optional[int] = None,
-    child_thr: float = 0.55,
+    camera_mode: str = "mobile",
+    tid: Optional[int] = None,
 ) -> Tuple[str, Optional[float]]:
     """
-    ADULT / CHILD / UNKNOWN via body-axis-projected proportion scoring.
+    ADULT / CHILD / UNKNOWN via 5-cue weighted anthropometric ensemble.
 
-    All proportions are measured along the **spine direction** (hip→shoulder
-    vector), not along the image y-axis. Projecting keypoints onto the spine
-    gives anatomical lengths that are invariant to body orientation — works
-    whether the person is standing, walking, bending forward, or sitting —
-    and to face direction (head protrusion is perpendicular to the spine, so
-    it cancels in projection).
-
-    Cues (all scale-invariant, projected onto body axis):
-        head_h / body_h  — primary,   weight 0.65
-        head_h / torso_h — secondary, weight 0.35
-
-    Leg/torso is intentionally omitted: it peaks around age 5–7 (children of
-    that age have proportionally longer legs than adults), so a high ratio
-    can mean either child or adult — ambiguous, removed.
+    Uses camera_mode ('mobile' or 'cctv') to select the appropriate
+    calibration profile for reference ranges, weights, and threshold.
 
     Returns (label, child_score) where child_score ∈ [0,1], 1 = clearly child.
-    Returns UNKNOWN when keypoints are insufficient or pose is too foreshortened
-    to measure reliably; _smooth_type preserves the last confident label.
-
-    p_bbox and frame_h are accepted for backwards compatibility but unused.
+    Returns UNKNOWN when keypoints are insufficient; _smooth_type preserves
+    the last confident label.
     """
     nose = _gkp(kp, KP_NOSE)
     ls = _gkp(kp, KP_L_SHOULDER)
@@ -534,45 +564,99 @@ def classify_person_type(
     # Spine vector defines the body's local "up" direction.
     spine = sh - hip
     torso_h = float(np.linalg.norm(spine))
-    if torso_h < 10.0:
-        # Too short in image — heavy foreshortening or bad keypoints
+    # CCTV subjects are often small in frame; allow shorter spines there.
+    # Mobile/webcam keeps the stricter cutoff to reject foreshortened/noisy
+    # poses at close range.
+    min_torso = 6.0 if camera_mode == "cctv" else 10.0
+    if torso_h < min_torso:
         return "UNKNOWN", None
     unit_spine = spine / torso_h
 
     # Head extension above shoulders along the spine.
     head_h = float(np.dot(nose - sh, unit_spine))
-    if head_h <= 3.0:
-        # Head not extending along spine direction — chin tucked, head down,
-        # or pose unparseable. Bail and let the sticky smoother hold.
+    min_head = 2.0 if camera_mode == "cctv" else 3.0
+    if head_h <= min_head:
         return "UNKNOWN", None
+
+    # Leg projection along spine (reused by multiple cues).
+    leg_proj = None
+    body_h = None
+    if ank is not None:
+        leg_proj = float(np.dot(hip - ank, unit_spine))
+        if leg_proj > 5.0:
+            body_h = head_h + torso_h + leg_proj
+
+    cal = _CALIB.get(camera_mode, _CALIB["mobile"])
+    child_thr = cal["thr"]
 
     scores: List[Tuple[float, float]] = []  # (cue_score in [0,1], weight)
 
-    # PRIMARY: head height / total body length along spine.
-    # body_h = head + torso + leg projections.
-    # Anthropometric: adult ~0.09 · 6y ~0.13 · 2y ~0.16 (ratios derived from
-    # 8/6/5 head-counts respectively).
-    if ank is not None:
-        leg_proj = float(np.dot(hip - ank, unit_spine))
-        if leg_proj > 5.0:  # legs aligned with spine (i.e. body roughly straight)
-            body_h = head_h + torso_h + leg_proj
-            r = head_h / body_h
-            s = float(np.clip((r - 0.095) / (0.140 - 0.095), 0.0, 1.0))
-            scores.append((s, 0.65))
+    c1 = cal["cue1"]  # head/body
+    if body_h is not None:
+        r = head_h / body_h
+        s = float(np.clip((r - c1["adult"]) / (c1["child"] - c1["adult"]), 0.0, 1.0))
+        scores.append((s, c1["w"]))
 
-    # SECONDARY: head height / torso height (always available given we have
-    # nose, shoulders, hips). Adult ~0.28 · 6y ~0.45 · 2y ~0.50.
+    c2 = cal["cue2"]  # head/torso (always available)
     r = head_h / torso_h
-    s = float(np.clip((r - 0.30) / (0.46 - 0.30), 0.0, 1.0))
-    scores.append((s, 0.35))
+    s = float(np.clip((r - c2["adult"]) / (c2["child"] - c2["adult"]), 0.0, 1.0))
+    scores.append((s, c2["w"]))
 
-    if not scores:
+    c3 = cal["cue3"]  # leg/torso (INVERTED: adult > child)
+    if leg_proj is not None and leg_proj > 5.0:
+        r = leg_proj / torso_h
+        s = float(np.clip((c3["adult"] - r) / (c3["adult"] - c3["child"]), 0.0, 1.0))
+        scores.append((s, c3["w"]))
+
+    c4 = cal["cue4"]  # shoulder_width/body (HIGH = child)
+    if ls is not None and rs is not None and body_h is not None:
+        sw = float(np.linalg.norm(ls - rs))
+        r = sw / body_h
+        s = float(np.clip((r - c4["adult"]) / (c4["child"] - c4["adult"]), 0.0, 1.0))
+        scores.append((s, c4["w"]))
+
+    c5 = cal["cue5"]  # upper/body (HIGH = child)
+    if body_h is not None:
+        upper = head_h + torso_h
+        r = upper / body_h
+        s = float(np.clip((r - c5["adult"]) / (c5["child"] - c5["adult"]), 0.0, 1.0))
+        scores.append((s, c5["w"]))
+
+    # Per-profile minimum number of cues. Mobile is permissive (1 cue is
+    # enough); CCTV requires 2 since cues are noisier and ankle-dependent
+    # cues frequently drop out.
+    min_cues = cal.get("min_cues", 1)
+    if len(scores) < min_cues:
         return "UNKNOWN", None
 
     total_w = sum(w for _, w in scores)
     child_score = sum(s * w for s, w in scores) / total_w
 
-    label = "CHILD" if child_score >= child_thr else "ADULT"
+    # DEBUG: print raw ratios so we can calibrate from real data
+    _dbg_parts = [f"head/body={head_h/body_h:.3f}" if body_h else "head/body=N/A"]
+    _dbg_parts.append(f"head/torso={head_h/torso_h:.3f}")
+    if leg_proj and leg_proj > 5.0:
+        _dbg_parts.append(f"leg/torso={leg_proj/torso_h:.3f}")
+    if ls is not None and rs is not None and body_h:
+        _dbg_parts.append(f"sh_w/body={float(np.linalg.norm(ls-rs))/body_h:.3f}")
+    if body_h:
+        _dbg_parts.append(f"upper/body={(head_h+torso_h)/body_h:.3f}")
+    _id_part = f"ID:{tid}" if tid is not None else "ID:?"
+    logger.info(
+        f"CHILD_DBG | {_id_part} | mode={camera_mode} | "
+        f"{' | '.join(_dbg_parts)} | score={child_score:.3f}"
+    )
+
+    # Deadband: only commit to a class when score is clearly on one side.
+    # Borderline scores return UNKNOWN so the sticky lock holds the prior
+    # label rather than flipping on noise.
+    margin = cal.get("margin", 0.10)
+    if child_score >= child_thr + margin:
+        label = "CHILD"
+    elif child_score <= child_thr - margin:
+        label = "ADULT"
+    else:
+        label = "UNKNOWN"
     return label, round(child_score, 3)
 
 
@@ -672,6 +756,7 @@ class HomeSafetyInference:
         # Module toggles (set per-session by the backend based on user profile)
         self.child_enabled = True
         self.elderly_enabled = True
+        self.camera_mode = "mobile"  # "mobile" or "cctv"
 
         logger.info(f"Device    : {self.device}")
         logger.info(f"Mode      : {mode}")
@@ -730,6 +815,11 @@ class HomeSafetyInference:
         # for confidence smoothing via temporal consistency.
         self._hazard_history: Dict[str, deque] = {}  # name → deque of (frame, conf)
         self._hazard_miss_count: Dict[str, int] = {}  # consecutive frames not detected
+        # Temporal smoothing of the per-frame child_score per track.
+        # The median of the last N valid scores is what passes through the
+        # deadband to produce the raw_type fed to _smooth_type. This stops
+        # single noisy frames from shifting a track between classes.
+        self.child_score_hist: Dict[int, deque] = {}  # tid → deque[float]
         self.heuristic.reset()
 
     def _compile_openvino_for_gpu(self, yolo_model) -> None:
@@ -933,7 +1023,31 @@ class HomeSafetyInference:
         self.kp_buffers[tid].append(kp_norm if valid >= 3 else None)
 
         p_bbox = kp_to_bbox(kp_pixel, fh)
-        raw_type, ratio = classify_person_type(kp_pixel, p_bbox, fh)
+        raw_type, ratio = classify_person_type(
+            kp_pixel, p_bbox, fh, self.camera_mode, tid=tid
+        )
+
+        # Temporal smoothing — CCTV only. Mobile/webcam keeps the original
+        # per-frame classification because that pipeline was already stable.
+        # CCTV is noisier (foreshortening, partial keypoints, unmeasured
+        # boundaries) so we replace the per-frame label with the median
+        # of the last 8 scores, run through the deadband.
+        if self.camera_mode == "cctv" and ratio is not None:
+            buf = self.child_score_hist.setdefault(tid, deque(maxlen=8))
+            buf.append(float(ratio))
+            if len(buf) >= 4:
+                smoothed = float(np.median(buf))
+                cal = _CALIB["cctv"]
+                thr = cal["thr"]
+                margin = cal.get("margin", 0.04)
+                if smoothed >= thr + margin:
+                    raw_type = "CHILD"
+                elif smoothed <= thr - margin:
+                    raw_type = "ADULT"
+                else:
+                    raw_type = "UNKNOWN"
+                ratio = round(smoothed, 3)
+
         person_type = self._smooth_type(tid, raw_type)
         h_state, h_score = self.heuristic.classify(kp_pixel, fh, tid)
 
@@ -1200,6 +1314,7 @@ class HomeSafetyInference:
                     self.alarm_fired,
                     self.inverted_count,
                     self.cached_tcn,
+                    self.child_score_hist,
                     self.heuristic.prev_kp,
                     self.heuristic.prev_cog,
                     self.heuristic.deb_count,

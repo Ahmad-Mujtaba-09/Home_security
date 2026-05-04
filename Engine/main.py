@@ -74,7 +74,7 @@ async def startup():
         tcn_weights=str(WEIGHTS_DIR / "tcn_fall_best.pt"),
         norm_mean=str(WEIGHTS_DIR / "norm_mean.npy"),
         norm_std=str(WEIGHTS_DIR / "norm_std.npy"),
-        hazard_weights=str(WEIGHTS_DIR / "best_int8_openvino_model"),
+        hazard_weights=str(WEIGHTS_DIR / "best.pt"),
         mode="hybrid",
         fall_threshold=0.65,
     )
@@ -322,6 +322,8 @@ async def websocket_inference(websocket: WebSocket, user_id: str):
 
     The engine checks the user's profile (child vs elderly modules) and runs
     only relevant detection logic.
+
+    Query parameter ``camera_mode`` selects calibration profile ('mobile' | 'cctv').
     """
     await websocket.accept()
     logger.info(f"WebSocket connected — user {user_id}")
@@ -331,17 +333,21 @@ async def websocket_inference(websocket: WebSocket, user_id: str):
         await websocket.close()
         return
 
+    # Camera mode from query parameter (default 'mobile')
+    camera_mode = websocket.query_params.get("camera_mode", "mobile")
+
     # Fetch user preferences
     profile = _get_user_profile(user_id)
     child_enabled = profile.get("child_module_enabled", True)
     elderly_enabled = profile.get("elderly_module_enabled", True)
 
-    logger.info(f"User {user_id} — child={child_enabled}, elderly={elderly_enabled}")
+    logger.info(f"User {user_id} — child={child_enabled}, elderly={elderly_enabled}, camera_mode={camera_mode}")
 
     # Reset engine state and set module toggles for this session
     inference_system.reset_state()
     inference_system.child_enabled = child_enabled
     inference_system.elderly_enabled = elderly_enabled
+    inference_system.camera_mode = camera_mode
     frame_count = 0
 
     try:
@@ -452,10 +458,13 @@ async def websocket_process_video(websocket: WebSocket, user_id: str):
         logger.info(f"Processing video: {filename} ({total} frames)")
 
         # Fetch user preferences and set module toggles
+        camera_mode = payload.get("camera_mode", "mobile")
         profile = _get_user_profile(user_id)
         inference_system.reset_state()
         inference_system.child_enabled = profile.get("child_module_enabled", True)
         inference_system.elderly_enabled = profile.get("elderly_module_enabled", True)
+        inference_system.camera_mode = camera_mode
+        logger.info(f"Video camera_mode={camera_mode}")
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
         inference_system.fps = fps
         frame_count = 0
@@ -561,10 +570,13 @@ async def websocket_stream(websocket: WebSocket, user_id: str):
             return
 
         # Fetch user preferences and set module toggles
+        camera_mode = payload.get("camera_mode", "mobile")
         profile = _get_user_profile(user_id)
         inference_system.reset_state()
         inference_system.child_enabled = profile.get("child_module_enabled", True)
         inference_system.elderly_enabled = profile.get("elderly_module_enabled", True)
+        inference_system.camera_mode = camera_mode
+        logger.info(f"Stream camera_mode={camera_mode}")
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
         inference_system.fps = fps
         frame_count = 0
