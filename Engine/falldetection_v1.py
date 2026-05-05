@@ -490,14 +490,14 @@ class HeuristicClassifier:
 _CALIB = {
     "mobile": {
         # Calibrated from eye-level webcam/mobile data.
-        "cue1": {"adult": 0.12, "child": 0.18, "w": 0.15},   # head/body
-        "cue2": {"adult": 0.35, "child": 0.60, "w": 0.10},   # head/torso
-        "cue3": {"adult": 1.30, "child": 0.85, "w": 0.35},   # leg/torso (inverted)
-        "cue4": {"adult": 0.20, "child": 0.30, "w": 0.15},   # sh_w/body
-        "cue5": {"adult": 0.48, "child": 0.58, "w": 0.25},   # upper/body
+        "cue1": {"adult": 0.12, "child": 0.18, "w": 0.15},  # head/body
+        "cue2": {"adult": 0.35, "child": 0.60, "w": 0.10},  # head/torso
+        "cue3": {"adult": 1.30, "child": 0.85, "w": 0.35},  # leg/torso (inverted)
+        "cue4": {"adult": 0.20, "child": 0.30, "w": 0.15},  # sh_w/body
+        "cue5": {"adult": 0.48, "child": 0.58, "w": 0.25},  # upper/body
         "thr": 0.45,
-        "margin": 0.0,    # mobile: original behavior, no deadband
-        "min_cues": 1,    # mobile: classify whenever any cue is available
+        "margin": 0.0,  # mobile: original behavior, no deadband
+        "min_cues": 1,  # mobile: classify whenever any cue is available
     },
     "cctv": {
         # CCTV cameras are typically elevated (2–3m), looking down.
@@ -508,11 +508,15 @@ _CALIB = {
         # NOTE: these boundaries are estimated, not measured. Use the
         # deadband to absorb small calibration errors, but keep it narrow
         # so true children don't get swallowed into UNKNOWN.
-        "cue1": {"adult": 0.10, "child": 0.15, "w": 0.30},   # head/body
-        "cue2": {"adult": 0.30, "child": 0.50, "w": 0.20},   # head/torso
-        "cue3": {"adult": 1.40, "child": 0.80, "w": 0.15},   # leg/torso (unreliable from above)
-        "cue4": {"adult": 0.18, "child": 0.30, "w": 0.15},   # sh_w/body
-        "cue5": {"adult": 0.45, "child": 0.58, "w": 0.20},   # upper/body
+        "cue1": {"adult": 0.10, "child": 0.15, "w": 0.30},  # head/body
+        "cue2": {"adult": 0.30, "child": 0.50, "w": 0.20},  # head/torso
+        "cue3": {
+            "adult": 1.40,
+            "child": 0.80,
+            "w": 0.15,
+        },  # leg/torso (unreliable from above)
+        "cue4": {"adult": 0.18, "child": 0.30, "w": 0.15},  # sh_w/body
+        "cue5": {"adult": 0.45, "child": 0.58, "w": 0.20},  # upper/body
         "thr": 0.45,
         "margin": 0.04,
         "min_cues": 2,
@@ -632,20 +636,20 @@ def classify_person_type(
     total_w = sum(w for _, w in scores)
     child_score = sum(s * w for s, w in scores) / total_w
 
-    # DEBUG: print raw ratios so we can calibrate from real data
-    _dbg_parts = [f"head/body={head_h/body_h:.3f}" if body_h else "head/body=N/A"]
-    _dbg_parts.append(f"head/torso={head_h/torso_h:.3f}")
-    if leg_proj and leg_proj > 5.0:
-        _dbg_parts.append(f"leg/torso={leg_proj/torso_h:.3f}")
-    if ls is not None and rs is not None and body_h:
-        _dbg_parts.append(f"sh_w/body={float(np.linalg.norm(ls-rs))/body_h:.3f}")
-    if body_h:
-        _dbg_parts.append(f"upper/body={(head_h+torso_h)/body_h:.3f}")
-    _id_part = f"ID:{tid}" if tid is not None else "ID:?"
-    logger.info(
-        f"CHILD_DBG | {_id_part} | mode={camera_mode} | "
-        f"{' | '.join(_dbg_parts)} | score={child_score:.3f}"
-    )
+    # # DEBUG: print raw ratios so we can calibrate from real data
+    # _dbg_parts = [f"head/body={head_h/body_h:.3f}" if body_h else "head/body=N/A"]
+    # _dbg_parts.append(f"head/torso={head_h/torso_h:.3f}")
+    # if leg_proj and leg_proj > 5.0:
+    #     _dbg_parts.append(f"leg/torso={leg_proj/torso_h:.3f}")
+    # if ls is not None and rs is not None and body_h:
+    #     _dbg_parts.append(f"sh_w/body={float(np.linalg.norm(ls-rs))/body_h:.3f}")
+    # if body_h:
+    #     _dbg_parts.append(f"upper/body={(head_h+torso_h)/body_h:.3f}")
+    # _id_part = f"ID:{tid}" if tid is not None else "ID:?"
+    # logger.info(
+    #     f"CHILD_DBG | {_id_part} | mode={camera_mode} | "
+    #     f"{' | '.join(_dbg_parts)} | score={child_score:.3f}"
+    # )
 
     # Deadband: only commit to a class when score is clearly on one side.
     # Borderline scores return UNKNOWN so the sticky lock holds the prior

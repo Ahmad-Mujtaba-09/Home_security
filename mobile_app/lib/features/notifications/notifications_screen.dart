@@ -16,6 +16,7 @@ class NotificationsScreen extends StatefulWidget {
 class _NotificationsScreenState extends State<NotificationsScreen> {
   List<NotificationItem> _items = [];
   bool _loading = true;
+  bool _markingAll = false;
 
   @override
   void initState() {
@@ -35,17 +36,19 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   Future<void> _markRead(int i) async {
     final n = _items[i];
     if (n.readStatus) return;
-    final ok = await ApiService.markNotificationRead(n.notificationId);
-    if (ok && mounted) setState(() => _items[i] = n.copyWith(readStatus: true));
+    setState(() => _items[i] = n.copyWith(readStatus: true));
+    await ApiService.markNotificationRead(n.notificationId);
   }
 
   Future<void> _markAllRead() async {
-    for (final n in _items.where((x) => !x.readStatus)) {
+    if (_markingAll) return;
+    _markingAll = true;
+    final unread = _items.where((x) => !x.readStatus).toList();
+    if (mounted) setState(() => _items = _items.map((n) => n.copyWith(readStatus: true)).toList());
+    for (final n in unread) {
       await ApiService.markNotificationRead(n.notificationId);
     }
-    if (mounted) {
-      setState(() => _items = _items.map((n) => n.copyWith(readStatus: true)).toList());
-    }
+    _markingAll = false;
   }
 
   int get _unreadCount => _items.where((n) => !n.readStatus).length;

@@ -5,6 +5,7 @@ import '../../core/app_colors.dart';
 import '../../data/supabase_service.dart';
 import '../../data/api_service.dart';
 import '../../data/notification_manager.dart';
+import '../../data/push_notification_service.dart';
 import '../../theme/theme_provider.dart';
 import '../history/history_screen.dart';
 import '../ai/summary_screen.dart';
@@ -47,6 +48,9 @@ class _HomeShellState extends State<HomeShell> {
     if (profile != null && mounted) {
       themeProvider.setLight(profile.lightMode);
     }
+
+    // Register FCM token now that the user is logged in
+    await PushNotificationService.registerToken();
 
     // Start realtime subscription
     supa.subscribeToHistory();
