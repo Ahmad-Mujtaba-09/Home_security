@@ -1,4 +1,4 @@
-# 🛡️ SafeGuard — Intelligent Home Safety Surveillance System
+# 🛡️ IHS — Intelligent Home Surveillance System
 
 > **Final Year Project** — Real-time fall detection, hazard recognition, child safety monitoring, background device surveillance, and AI-powered emergency guidance.
 
@@ -11,13 +11,13 @@
 
 ## 📋 Overview
 
-SafeGuard is an end-to-end home safety surveillance platform that combines deep learning–based video analytics with a mobile companion app and a desktop control panel. It is designed to protect elderly individuals and children within a home environment by continuously monitoring camera feeds for:
+Intelligent Home Surveillance (IHS) is an end-to-end home safety surveillance platform that combines deep learning–based video analytics with a mobile companion app and a desktop control panel. It is designed to protect elderly individuals and children within a home environment by continuously monitoring camera feeds for:
 
 | Capability | Description |
 |---|---|
 | **Fall Detection** | Hybrid TCN + heuristic classifier blending temporal pose sequences with rule-based biomechanics |
 | **Inactivity Alerts** | Timer-based alarm when a person remains on the floor beyond a configurable threshold |
-| **Hazard Detection** | YOLOv8-trained object detector for knives, fire, stairs, ovens, and stoves |
+| **Hazard Detection** | Custom-trained YOLOv8 object detector for knives, fire, stairs, ovens, and stoves |
 | **Child Safety** | Skeleton-ratio age classification with proximity alerts when children approach hazards |
 | **Background Monitoring** | Server-side `DeviceMonitorManager` processes RTSP/HTTP streams independently of client connections |
 | **First Aid Chatbot** | RAG-powered Q&A over official first aid manuals (FAISS + BM25 hybrid retrieval, Groq LLM) |
@@ -93,7 +93,8 @@ SafeGuard is an end-to-end home safety surveillance platform that combines deep 
 ├── weights/                      # Pre-trained model weights (git-ignored)
 │   ├── yolov8s-pose.pt             # YOLOv8-small pose estimation
 │   ├── tcn_fall_best.pt            # Trained TCN fall classifier
-│   ├── best_int8_openvino_model/   # Hazard detector (INT8 OpenVINO)
+│   ├── best.pt                     # Trained hazard detector (YOLOv8)
+│   ├── sticky_tracker.yaml         # ByteTrack tracker config
 │   ├── norm_mean.npy               # Feature normalisation statistics
 │   └── norm_std.npy
 │
@@ -117,7 +118,7 @@ SafeGuard is an end-to-end home safety surveillance platform that combines deep 
 ### 1. Clone & Setup Environment
 
 ```bash
-git clone <repo-url> && cd SafeGuard
+git clone <repo-url> && cd <repo-dir>
 ```
 
 ### 2. Start the Inference Engine
@@ -201,7 +202,7 @@ Run the SQL migration against your Supabase project:
 
 ### Hazard Detection
 
-- Custom-trained YOLOv8 (INT8 OpenVINO) detecting: **knife, fire, stairs, oven, stove**
+- Custom-trained YOLOv8 (`best.pt`) detecting: **knife, fire, stairs, oven, stove**
 - Temporal confidence smoothing over 5-frame sliding window
 - Child-hazard proximity alerts with object-specific distance thresholds
 
@@ -316,7 +317,7 @@ All new tables enforce **Row-Level Security (RLS)** for user-scoped access. The 
 
 | Layer | Technology |
 |---|---|
-| **Inference** | PyTorch, YOLOv8 (Ultralytics), OpenVINO, OpenCV, SciPy |
+| **Inference** | PyTorch, YOLOv8 (Ultralytics), OpenCV, SciPy |
 | **Backend** | FastAPI, Uvicorn, WebSockets, asyncio |
 | **Background Monitoring** | DeviceMonitorManager (asyncio tasks, shared YOLO + state isolation) |
 | **RAG** | FAISS, BM25, sentence-transformers, Groq API |
