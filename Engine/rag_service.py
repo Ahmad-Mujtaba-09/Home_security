@@ -30,6 +30,14 @@ EMBEDDINGS_DIR = ENGINE_DIR / "embeddings"
 # Local embedding model (same as used during index building)
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
+# Minimum dense cosine similarity for the corpus to be considered relevant to a
+# query at all. Retrieval always returns top_k by rank, so without a floor an
+# off-topic question still drags back its six least-bad chunks. Measured against
+# this index, off-topic queries peak at ~0.18 and on-topic ones bottom out at
+# ~0.52, so 0.35 sits in empty space between the two. Re-measure if the
+# embedding model or corpus changes — the number is calibrated, not universal.
+MIN_RELEVANCE_SCORE = 0.35
+
 
 class RAGService:
     """RAG pipeline: local retrieval + Groq API generation."""
@@ -97,7 +105,8 @@ class RAGService:
         Full RAG pipeline:
         1. Hybrid retrieval (FAISS + BM25) — fully local
         2. Reciprocal Rank Fusion
-        3. Answer generation via Groq API
+        3. Relevance gate — bail out if nothing in the corpus is close enough
+        4. Answer generation via Groq API
         """
         if not self._ready:
             return {
@@ -114,10 +123,26 @@ class RAGService:
 
         try:
             # Step 1: Hybrid retrieval (local)
-            candidates = self._hybrid_retrieve(user_message, top_k=top_k * 3)
+            candidates, best_score = self._hybrid_retrieve(
+                user_message, top_k=top_k * 3
+            )
             top_candidates = candidates[:top_k]
 
-            # Step 2: Generate answer via Groq
+            # Step 2: Relevance gate. Answering off-topic questions is not this
+            # bot's job, and passing junk context to the model just invites it
+            # to improvise a referral elsewhere.
+            if not top_candidates or best_score < MIN_RELEVANCE_SCORE:
+                logger.info(
+                    f"Query below relevance floor (best={best_score:.3f}): {user_message[:60]!r}"
+                )
+                return {
+                    "reply": "I couldn't find anything about that in the first aid "
+                             "references. Try asking about an injury, emergency, or "
+                             "health concern.",
+                    "sources": []
+                }
+
+            # Step 3: Generate answer via Groq
             reply, sources = await self._generate_answer(
                 user_message, top_candidates, chat_history
             )
@@ -132,13 +157,21 @@ class RAGService:
 
     # ─── Hybrid Retrieval (fully local) ──────────────────────────────────────
 
-    def _hybrid_retrieve(self, query: str, top_k: int = 18) -> List[Dict]:
-        """FAISS + BM25 with Reciprocal Rank Fusion."""
+    def _hybrid_retrieve(self, query: str,
+                         top_k: int = 18) -> Tuple[List[Dict], float]:
+        """FAISS + BM25 with Reciprocal Rank Fusion.
+
+        Also returns the best dense cosine similarity, which is the only honest
+        relevance signal available here: RRF scores are rank-derived
+        (1/(60+rank)), so the top chunk scores the same whether it is a perfect
+        match or the least-bad of a bad lot.
+        """
         half_k = max(top_k, 10)
         dense_results = self._dense_search(query, top_k=half_k)
         sparse_results = self._bm25_search(query, top_k=half_k)
         fused = self._reciprocal_rank_fusion(dense_results, sparse_results, k=60)
-        return fused[:top_k]
+        best_score = max((s for _, s in dense_results), default=0.0)
+        return fused[:top_k], best_score
 
     def _dense_search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
         """Search FAISS index with local query embedding (lazy-loads model)."""
@@ -200,10 +233,8 @@ class RAGService:
                                 ) -> Tuple[str, List[Dict]]:
         """Generate a grounded answer using Groq API."""
         context_parts = []
-        source_set = set()
         for i, chunk in enumerate(context_chunks):
             source_ref = f"{chunk['source']}, p.{chunk['page']}"
-            source_set.add((chunk['source'], chunk['page']))
             context_parts.append(f"[Source {i+1}: {source_ref}]\n{chunk['text']}")
 
         context_block = "\n\n---\n\n".join(context_parts)
@@ -247,12 +278,43 @@ class RAGService:
                 resp.raise_for_status()
                 reply = resp.json()["choices"][0]["message"]["content"]
 
-            sources = [{"book": s[0], "page": s[1]} for s in sorted(source_set)]
+            # Prefer the passages the model actually cited. It cites
+            # inconsistently, so fall back to everything it was shown — safe
+            # only because the relevance gate already rejected off-topic
+            # queries, so these chunks are known to be on-subject.
+            sources = self._cited_sources(reply, context_chunks)
+            if not sources:
+                sources = self._all_sources(context_chunks)
             return reply, sources
 
         except Exception as e:
             logger.error(f"Groq generation error: {e}")
             return (f"Error generating response: {str(e)}", [])
+
+    # ─── Citation parsing ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cited_sources(reply: str, context_chunks: List[Dict]) -> List[Dict]:
+        """Map [Source N] citations in the reply back to their chunks.
+
+        N is 1-based and matches the numbering handed to the model in the
+        prompt. Handles the shapes the model actually emits — [Source 1],
+        [Source 1, 2, 3], [Sources 1 and 2], [Source 1][Source 2]. Numbers
+        outside the range of what was retrieved are dropped rather than
+        trusted, since a hallucinated citation index is not evidence.
+        """
+        cited = set()
+        for span in re.findall(r"\[Sources?\b[^\]]*\]", reply):
+            cited.update(int(n) for n in re.findall(r"\d+", span))
+        return RAGService._all_sources(
+            [context_chunks[i - 1] for i in cited if 1 <= i <= len(context_chunks)]
+        )
+
+    @staticmethod
+    def _all_sources(chunks: List[Dict]) -> List[Dict]:
+        """Deduplicated (book, page) list for the given chunks."""
+        source_set = {(c["source"], c["page"]) for c in chunks}
+        return [{"book": s[0], "page": s[1]} for s in sorted(source_set)]
 
     # ─── Tokenizer ────────────────────────────────────────────────────────────
 
