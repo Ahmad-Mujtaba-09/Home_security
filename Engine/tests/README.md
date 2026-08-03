@@ -79,11 +79,12 @@ Smoke test (placeholder — Supabase requires `.env` at runtime).
 
 ---
 
-## Flutter (Engine/flutter_app)
+## Flutter (chrome_app)
 
 ```bash
-cd Engine/flutter_app
+cd chrome_app
 flutter test
+flutter analyze
 ```
 
-Smoke test only — the Engine flutter app's integration testing is done through the Python backend tests.
+Smoke test only — the Chrome app's integration behaviour is covered through the Python backend tests.

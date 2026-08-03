@@ -1,9 +1,9 @@
-<![CDATA[# ==============================================================================
-# SafeGuard .gitignore
-# Only track: Engine/ and mobile_app/ (plus root-level files)
+# ==============================================================================
+# IHS .gitignore
+# Tracked source: Engine/, chrome_app/, mobile_app/, supabase/ (+ root files)
 # ==============================================================================
 
-# ─── Ignore all top-level directories except Engine and mobile_app ────────────
+# ─── Large / non-source top-level directories ────────────────────────────────
 /books/
 /docs/
 /weights/
@@ -21,18 +21,31 @@ venv/
 .venv/
 env/
 .env.local
+.pytest_cache/
 
 # ─── Engine-specific ignores ─────────────────────────────────────────────────
 Engine/__pycache__/
 Engine/.vscode/
 Engine/datasets/
 Engine/testing/
-Engine/flutter_app/
 Engine/embeddings/
 Engine/firebase-service-account.json
 Engine/*.errors.txt
 
-# ─── Flutter / Dart ───────────────────────────────────────────────────────────
+# ─── Flutter / Dart — chrome_app (desktop/web control panel) ─────────────────
+chrome_app/.dart_tool/
+chrome_app/.idea/
+chrome_app/build/
+chrome_app/.flutter-plugins
+chrome_app/.flutter-plugins-dependencies
+chrome_app/.metadata
+chrome_app/pubspec.lock
+chrome_app/*.iml
+chrome_app/android/local.properties
+chrome_app/ios/Flutter/Generated.xcconfig
+chrome_app/ios/Flutter/flutter_export_environment.sh
+
+# ─── Flutter / Dart — mobile_app ─────────────────────────────────────────────
 mobile_app/.dart_tool/
 mobile_app/.idea/
 mobile_app/build/
@@ -41,6 +54,7 @@ mobile_app/.flutter-plugins-dependencies
 mobile_app/.metadata
 mobile_app/pubspec.lock
 mobile_app/*.iml
+mobile_app/android/local.properties
 
 # ─── IDE ──────────────────────────────────────────────────────────────────────
 .vscode/
@@ -67,6 +81,7 @@ GoogleService-Info.plist
 *.errors.txt
 *.mp4
 *.pt
+*.h5
 *.npy
 *.index
-]]>
+*.zip

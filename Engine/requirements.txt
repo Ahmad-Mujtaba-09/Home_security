@@ -13,6 +13,11 @@ python-dotenv
 supabase
 httpx
 
+# ── Push notifications (FCM HTTP v1) ─────────
+# RS256 signing of the service-account JWT in _get_fcm_access_token().
+# Without the [crypto] extra, push silently falls back to "no access token".
+PyJWT[crypto]
+
 # ── RAG Chatbot ──────────────────────────────
 PyMuPDF
 faiss-cpu

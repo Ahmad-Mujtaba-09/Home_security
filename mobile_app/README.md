@@ -8,7 +8,7 @@
 
 SafeGuard Mobile is the **companion app** for the SafeGuard surveillance system. It connects to the inference engine backend via REST APIs to provide device management, background monitoring control, in-app notifications, detection history, AI-generated reports, and an interactive first aid chatbot.
 
-The mobile app does **not** run live camera inference — that is handled by the [Engine Flutter App](../Engine/flutter_app/) (desktop/web) or by the backend's **DeviceMonitorManager** (background RTSP/HTTP stream processing). The mobile app is designed for:
+The mobile app does **not** run live camera inference — that is handled by the [Chrome app](../chrome_app/) (desktop/web control panel) or by the backend's **DeviceMonitorManager** (background RTSP/HTTP stream processing). The mobile app is designed for:
 
 - 📷 **Managing devices** — Register cameras, start/stop background monitoring
 - 🔔 **Receiving alerts** — FCM push notifications + in-app notification inbox
@@ -101,7 +101,7 @@ mobile_app/
 
 - **Flutter SDK** ≥ 3.2.0
 - **Android Studio** or **VS Code** with Flutter extension
-- **Supabase** project (URL + service role key)
+- **Supabase** project (URL + anon key)
 - **Firebase** project (for push notifications)
 
 ### Setup
@@ -115,13 +115,23 @@ mobile_app/
 
 2. **Configure environment:**
 
-   Edit `.env` with your credentials:
+   ```bash
+   cp .env.example .env
+   ```
 
    ```env
    SUPABASE_URL=https://your-project.supabase.co
    SUPABASE_ANON_KEY=eyJ...
-   SUPABASE_SERVICE_ROLE_KEY=eyJ...
+
+   # The Engine, reachable from the phone — a LAN IP or an ngrok URL, never localhost
+   INFERENCE_API_URL=http://192.168.1.10:8000
+   CHATBOT_API_URL=http://192.168.1.10:8000
    ```
+
+   > ⚠️ `main.dart` currently prefers `SUPABASE_SERVICE_ROLE_KEY` over the anon key if one is
+   > present, and Flutter bundles `.env` into the APK as a readable asset. A service-role key
+   > shipped this way is extractable from the build and bypasses every RLS policy. Leave it out
+   > of `mobile_app/.env` — the anon-key fallback is what you want.
 
 3. **Firebase setup:**
 

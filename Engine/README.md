@@ -11,7 +11,7 @@ The Engine is the backend intelligence layer of SafeGuard. It runs multi-model i
 ### Key Capabilities
 
 - **Fall Detection** — Hybrid TCN deep learning + heuristic biomechanics classifier
-- **Hazard Detection** — YOLOv8 object detection (knife, fire, stairs, oven, stove) with OpenVINO INT8
+- **Hazard Detection** — YOLOv8 object detection (knife, fire, stairs, oven, stove)
 - **Child Safety** — Skeleton-ratio classification + hazard proximity alerts
 - **Inactivity Monitoring** — Timer-based alarm for prolonged immobility after falls
 - **Background Device Monitoring** — `DeviceMonitorManager` processes RTSP/HTTP streams at ~2 FPS independently of clients
@@ -33,18 +33,14 @@ Engine/
 ├── rag_service.py                 # RAG pipeline: retrieval + Groq generation
 ├── generate_embeddings.py         # Offline: PDF → chunks → FAISS index builder
 ├── requirements.txt               # Python dependencies
-├── .env                           # Environment variables (keys, URLs)
-├── firebase-service-account.json  # FCM service account (do not commit)
+├── .env                           # Environment variables (git-ignored)
+├── .env.example                   # Template — copy to .env and fill in
+├── firebase-service-account.json  # FCM service account (git-ignored)
 │
-├── embeddings/                    # Pre-built search indices
-│   ├── faiss.index                  # Dense vector index (~1.2MB)
+├── embeddings/                    # Pre-built search indices (git-ignored)
+│   ├── faiss.index                  # Dense vector index
 │   ├── chunks.json                  # Chunk metadata (text, source, page)
-│   └── bm25_corpus.json            # Tokenized corpus for sparse retrieval
-│
-├── flutter_app/                   # Desktop/web Flutter control panel
-│   ├── lib/features/                # auth, dashboard, devices, notifications,
-│   │                                  history, summaries, chatbot, profile
-│   └── lib/data/                    # API service, models, Supabase service
+│   └── bm25_corpus.json             # Tokenized corpus for sparse retrieval
 │
 ├── tests/                         # Python test suite (pytest)
 │   ├── conftest.py                  # Path setup fixtures
@@ -52,9 +48,12 @@ Engine/
 │   ├── test_falldetection_v1.py     # Detection helpers + state swap tests (15 tests)
 │   └── test_rag_service.py          # RAG pipeline tests (9 tests)
 │
-├── datasets/                      # Training datasets (COCO format)
-└── testing/                       # Test video files
+└── testing/                       # Sample videos for manual testing (git-ignored)
 ```
+
+Sibling directories the Engine depends on: `../weights/` (model files), `../books/`
+(source PDFs for the RAG index), and `../supabase/migrations/` (database schema).
+The Flutter clients live in `../chrome_app/` and `../mobile_app/`.
 
 ---
 
@@ -77,16 +76,33 @@ pip install -r requirements.txt
 
 ### Environment Setup
 
-Create or edit `.env` in this directory:
+```bash
+cp .env.example .env
+```
+
+`Engine/.env` is shared with the Chrome app — `chrome_app/.env` is a symlink to it,
+so it holds both sets of keys:
 
 ```env
-# Supabase
+# Read by the Engine
 SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=eyJ...
-
-# Groq LLM (free tier)
+SUPABASE_SERVICE_ROLE_KEY=eyJ...      # bypasses RLS — server-side only
 GROQ_API_KEY=gsk_...
 GROQ_MODEL=llama-3.1-8b-instant
+
+# Read by chrome_app
+SUPABASE_ANON_KEY=eyJ...
+INFERENCE_API_URL=http://localhost:8000
+CHATBOT_API_URL=http://localhost:8000
+```
+
+### Database Setup (One-Time)
+
+Run both migrations, in filename order, in the Supabase SQL editor:
+
+```
+../supabase/migrations/20260505000000_core_schema.sql
+../supabase/migrations/20260505000001_add_devices_notifications_summaries_chat.sql
 ```
 
 ### Build the RAG Index (One-Time)
@@ -173,9 +189,12 @@ RTSP/HTTP stream processing.
 
 ### 1. Pose Estimation
 
-- **Model:** YOLOv8s-Pose (`yolov8s-pose.pt`)
+- **Model:** YOLOv8s-Pose, loaded by bare name (`yolov8s-pose.pt`) — Ultralytics resolves it
+  from the working directory and downloads it there on first run if missing. A copy is also
+  kept in `../weights/`.
 - **Output:** 17 COCO keypoints per person with confidence scores
-- **Tracking:** BoT-SORT tracker for persistent person IDs
+- **Tracking:** ByteTrack for persistent person IDs, tuned in `../weights/sticky_tracker.yaml`
+  (`track_buffer: 150`, `match_thresh: 0.95`) so IDs survive a person lying still
 - **Optimisation:** Frame decimation (2× skip) + motion gating (~500px threshold)
 
 ### 2. Fall Detection — TCN
@@ -210,7 +229,8 @@ P_final = 0.70 × P_tcn + 0.30 × P_heuristic
 
 ### 5. Hazard Detection
 
-- **Model:** Custom YOLOv8 INT8 OpenVINO (`best_int8_openvino_model/`)
+- **Model:** Custom-trained YOLOv8 (`../weights/best.pt`). An OpenVINO GPU compile path
+  exists (`_compile_openvino_for_gpu`) but is currently commented out.
 - **Classes:** knife (0.40), fire (0.50), stairs (0.30), oven (0.25), stove (0.25) — per-class confidence thresholds
 - **Temporal smoothing:** 5-frame sliding window with confidence bonus for persistent detections
 - **Child proximity:** Normalised distance thresholds per hazard type (e.g., knife: 0.18, fire: 0.30)
@@ -264,11 +284,16 @@ The backend uses the `service_role` key to bypass RLS for server-side inserts. N
 
 ## ⚠️ Important Notes
 
-- **Model weights** are stored in `../weights/` and are **not committed to git** (see `.gitignore`).
-- **`firebase-service-account.json`** must **never** be committed. Add it to `.gitignore`.
+- **Model weights** live in `../weights/` and are **not committed to git** (see `.gitignore`).
+  A fresh clone will not have them.
+- **`firebase-service-account.json`** must **never** be committed — it is already git-ignored.
+  Without it (and without `PyJWT[crypto]` installed) FCM push silently no-ops; everything
+  else keeps working.
 - The backend runs on **CPU by default**. Set `CUDA_VISIBLE_DEVICES` for GPU acceleration.
-- The `flutter_app/` directory is the **desktop/web control panel** — it runs alongside the Engine on the same machine.
-- The `mobile_app/` directory is the **mobile companion app** for alerts, history, and device management.
+- `../chrome_app/` is the **Chrome/desktop control panel** — it runs alongside the Engine on the
+  same machine and is the only client that performs live inference.
+- `../mobile_app/` is the **mobile companion app** for alerts, history, and device management.
+- `/api/gemini-report` is a **legacy endpoint name**. It calls Groq, not Gemini.
 
 ---
 
@@ -286,6 +311,7 @@ The backend uses the `service_role` key to bypass RLS for server-side inserts. N
 - `python-dotenv` — Environment variable loading
 - `supabase` — Database client
 - `httpx` — HTTP client (Groq API, FCM)
+- `PyJWT[crypto]` — RS256-signs the service-account JWT used to mint FCM access tokens
 
 ### RAG Chatbot
 - `PyMuPDF` — PDF text extraction

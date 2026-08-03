@@ -1,21 +1,11 @@
 -- ============================================================================
--- Migration: devices, notifications, incident_summaries, chat_sessions,
---            chat_messages
+-- Migration 20260505000001 — devices, notifications, incident_summaries,
+--                            chat_sessions, chat_messages
 --
--- Run this in the Supabase SQL editor (or via `supabase db push`).
--- Existing tables (profiles, history, fcm_tokens) are NOT modified.
+-- Requires 20260505000000_core_schema.sql (profiles, history, fcm_tokens and
+-- the handle_updated_at function). Core tables are NOT modified here.
+-- Run in the Supabase SQL editor, or via `supabase db push`.
 -- ============================================================================
-
--- Reuse the existing handle_updated_at function from the profiles table
--- (already created in your project). If it does not exist, uncomment the
--- block below.
---
--- create or replace function public.handle_updated_at()
--- returns trigger language plpgsql as $$
--- begin
---   new.updated_at = now();
---   return new;
--- end $$;
 
 
 -- ─── 1. devices ─────────────────────────────────────────────────────────────
