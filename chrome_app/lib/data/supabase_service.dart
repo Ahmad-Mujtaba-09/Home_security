@@ -20,8 +20,19 @@ class SupabaseService extends ChangeNotifier {
 
   // ── Auth ───────────────────────────────────────────────────────────────────
 
-  Future<AuthResponse> signUp(String email, String password) async {
-    final res = await _client.auth.signUp(email: email, password: password);
+  /// [name] is stored as `full_name` in the auth user's metadata — the profiles
+  /// table has no name column, and the row is created by the on_auth_user_created
+  /// trigger before we could write to it anyway.
+  Future<AuthResponse> signUp(
+    String email,
+    String password, {
+    String? name,
+  }) async {
+    final res = await _client.auth.signUp(
+      email: email,
+      password: password,
+      data: (name != null && name.isNotEmpty) ? {'full_name': name} : null,
+    );
     notifyListeners();
     return res;
   }

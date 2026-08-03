@@ -11,6 +11,7 @@ class SignupScreen extends StatefulWidget {
 }
 
 class _SignupScreenState extends State<SignupScreen> {
+  final _nameC = TextEditingController();
   final _emailC = TextEditingController();
   final _passC = TextEditingController();
   final _confirmC = TextEditingController();
@@ -19,6 +20,7 @@ class _SignupScreenState extends State<SignupScreen> {
 
   @override
   void dispose() {
+    _nameC.dispose();
     _emailC.dispose();
     _passC.dispose();
     _confirmC.dispose();
@@ -37,9 +39,11 @@ class _SignupScreenState extends State<SignupScreen> {
     }
     setState(() => _loading = true);
     try {
-      await context
-          .read<SupabaseService>()
-          .signUp(_emailC.text.trim(), _passC.text.trim());
+      await context.read<SupabaseService>().signUp(
+            _emailC.text.trim(),
+            _passC.text.trim(),
+            name: _nameC.text.trim(),
+          );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -96,14 +100,15 @@ class _SignupScreenState extends State<SignupScreen> {
                 ),
                 const SizedBox(height: 32),
                 TextField(
-                  controller: _emailC,
-                  keyboardType: TextInputType.emailAddress,
+                  controller: _nameC,
+                  keyboardType: TextInputType.name,
+                  textCapitalization: TextCapitalization.words,
                   decoration: const InputDecoration(
                     hintText: 'Name',
-                    // prefixIcon: Icon(Icons.email_outlined),
+                    prefixIcon: Icon(Icons.person_outline),
                   ),
                 ),
-                const SizedBox(height: 32),
+                const SizedBox(height: 16),
                 TextField(
                   controller: _emailC,
                   keyboardType: TextInputType.emailAddress,
